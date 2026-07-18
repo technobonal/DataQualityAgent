@@ -20,12 +20,14 @@ import pandas as pd
 
 from cleaning.missing_values import identify_missing, handle_missing_values
 from cleaning.formatting import auto_correct_format, clean_column_names, clean_text_column
+from cleaning.duplicates import identify_duplicates, handle_duplicates
 from cleaning.standardization import standardize_columns
 from cleaning.normalization import normalize_columns
 from cleaning.binning import bin_column
 from cleaning.indicators import create_indicator_variables
 from quality.outliers import detect_outliers_iqr, handle_outliers
 from quality.report import generate_quality_report
+from quality.recommendations import recommend_actions
 
 
 TOOLS_SCHEMA: list[dict[str, Any]] = [
@@ -390,6 +392,93 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "diagnosticar_y_recomendar",
+            "description": (
+                "Genera el reporte de calidad completo Y, a partir de él, la lista de "
+                "acciones que este archivo en particular necesita (ordenadas según el "
+                "flujo clásico de limpieza) más las tools que NO hace falta usar para "
+                "este dataset. Es la tool ideal para el primer diagnóstico apenas el "
+                "usuario sube un archivo — reemplaza tener que llamar "
+                "'generar_reporte_calidad' y decidir las acciones por separado."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "duplicate_subset": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Columnas específicas para chequear duplicados. Si se omite, compara la fila completa.",
+                    },
+                    "outlier_columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Columnas específicas para chequear outliers. Si se omite, revisa todas las numéricas.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "identificar_duplicados",
+            "description": (
+                "Detecta filas duplicadas en el dataset, sin modificarlo. Usar cuando "
+                "el usuario pregunte '¿tengo filas repetidas?' o '¿cuántos duplicados hay?'. "
+                "Para eliminarlos usar 'tratar_duplicados'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subset": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Columnas específicas para considerar al comparar filas "
+                            "(ej. solo ['id', 'email']). Si se omite, compara la fila completa."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tratar_duplicados",
+            "description": (
+                "Elimina filas duplicadas del dataset. Usar cuando el usuario pida "
+                "'eliminar duplicados', 'sacar las filas repetidas', 'quedarme con un "
+                "solo registro por id', etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["keep_first", "keep_last", "remove_all"],
+                        "description": (
+                            "'keep_first': conserva la primera aparición de cada duplicado. "
+                            "'keep_last': conserva la última. "
+                            "'remove_all': elimina TODAS las copias, sin conservar ninguna "
+                            "(útil cuando el duplicado en sí indica un dato sucio)."
+                        ),
+                    },
+                    "subset": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Columnas específicas para considerar. Si se omite, compara la fila completa.",
+                    },
+                },
+                "required": ["strategy"],
+            },
+        },
+    },
 ]
 
 
@@ -427,6 +516,18 @@ def dispatch_tool(name: str, arguments: dict[str, Any], df: pd.DataFrame) -> tup
     if name == "limpiar_columna_texto":
         df_nuevo = clean_text_column(df, column=arguments["column"], case=arguments.get("case"))
         return {"columna": arguments["column"], "case": arguments.get("case", None)}, df_nuevo
+
+    if name == "identificar_duplicados":
+        reporte = identify_duplicates(df, subset=arguments.get("subset"))
+        return reporte.to_dict(), None
+
+    if name == "tratar_duplicados":
+        df_nuevo, resultado = handle_duplicates(
+            df,
+            strategy=arguments["strategy"],
+            subset=arguments.get("subset"),
+        )
+        return resultado.to_dict(), df_nuevo
 
     if name == "estandarizar_columnas":
         df_nuevo, resultado = standardize_columns(
@@ -491,5 +592,17 @@ def dispatch_tool(name: str, arguments: dict[str, Any], df: pd.DataFrame) -> tup
             outlier_columns=arguments.get("outlier_columns"),
         )
         return reporte.to_dict(), None
+
+    if name == "diagnosticar_y_recomendar":
+        reporte = generate_quality_report(
+            df,
+            duplicate_subset=arguments.get("duplicate_subset"),
+            outlier_columns=arguments.get("outlier_columns"),
+        )
+        recomendacion = recommend_actions(reporte.to_dict())
+        return {
+            "diagnostico": reporte.to_dict(),
+            "recomendacion": recomendacion.to_dict(),
+        }, None
 
     raise ValueError(f"Tool desconocida: {name!r}")

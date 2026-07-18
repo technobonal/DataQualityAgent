@@ -1,0 +1,23 @@
+# === LLM / orquestación (core/llm_client.py, core/agent.py) ===
+groq
+litellm==1.91.3
+langchain
+langchain-groq
+
+# === RAG: vector store + embeddings (rag/) ===
+chromadb
+langchain-chroma
+cohere
+huggingface-hub
+
+# === Análisis y calidad de datos (quality/, cleaning/, analysis/) ===
+pandas
+numpy
+pandasai
+
+# === Visualización (analysis/charts.py) ===
+matplotlib
+seaborn
+
+# === Utilidades ===
+python-dotenv

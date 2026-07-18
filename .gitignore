@@ -1,0 +1,19 @@
+# Virtual environments
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Environment and Secrets
+.env
+
+# Data and Indexes
+data/uploads/
+chroma_db/
+.chroma/
+
+# System files
+.DS_Store
+
+.pytest_cache/
+.ipynb_checkpoints/

@@ -45,7 +45,8 @@ class HandleMissingResult:
     columns_processed: list[str] = field(default_factory=list)
     rows_dropped: int = 0
     columns_dropped: list[str] = field(default_factory=list)
-    values_filled: dict[str, int] = field(default_factory=dict)
+    values_filled: dict[str, int] = field(default_factory=dict)  # columna -> CANTIDAD de nulos rellenados
+    fill_values: dict[str, Any] = field(default_factory=dict)  # columna -> VALOR real usado para rellenar
 
     def to_dict(self) -> dict[str, Any]:
         """Serializa a dict plano — lo que tool_definitions.py le devuelve al LLM."""
@@ -138,6 +139,7 @@ def handle_missing_values(
             valor = df_nuevo[col].mean() if strategy == "mean" else df_nuevo[col].median()
             df_nuevo[col] = df_nuevo[col].fillna(valor)
             resultado.values_filled[col] = n_nulos
+            resultado.fill_values[col] = round(float(valor), 4)
             resultado.columns_processed.append(col)
 
     elif strategy == "mode":
@@ -150,8 +152,10 @@ def handle_missing_values(
             moda = df_nuevo[col].mode(dropna=True)
             if moda.empty:
                 continue
-            df_nuevo[col] = df_nuevo[col].fillna(moda.iloc[0])
+            valor = moda.iloc[0]
+            df_nuevo[col] = df_nuevo[col].fillna(valor)
             resultado.values_filled[col] = n_nulos
+            resultado.fill_values[col] = valor if not isinstance(valor, (int, float)) else round(float(valor), 4)
             resultado.columns_processed.append(col)
 
     elif strategy == "constant":
@@ -165,6 +169,7 @@ def handle_missing_values(
                 continue
             df_nuevo[col] = df_nuevo[col].fillna(constant_value)
             resultado.values_filled[col] = n_nulos
+            resultado.fill_values[col] = constant_value
             resultado.columns_processed.append(col)
 
     else:  # ffill / bfill
@@ -203,4 +208,3 @@ if __name__ == "__main__":
     df_res2, resumen2 = handle_missing_values(df_ejemplo, strategy="drop_rows")
     print(df_res2)
     print(resumen2.to_dict())
-    

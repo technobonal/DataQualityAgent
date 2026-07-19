@@ -24,19 +24,24 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+# llama-3.3-70b-versatile: 12.000 tokens/min en el free tier de Groq, contra
+# 8.000 de openai/gpt-oss-20b — más margen para un agente que manda 15 tool
+# schemas en cada llamada. Cambiar acá o en el .env si preferís otro modelo.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY", "")
 
 # Modelo de respaldo en Hugging Face Inference Providers, formato litellm:
 #   huggingface/<provider>/<hf_org_or_user>/<hf_model>
-# 'hf-inference' es el proveedor serverless propio de Hugging Face (no
-# requiere elegir un tercero como Fireworks/Together/Novita).
-# El catálogo de modelos disponibles cambia seguido — si este deja de
-# funcionar, revisar el catálogo vigente en:
+# IMPORTANTE: 'hf-inference' (el proveedor propio de Hugging Face) NO sirve
+# para chat/generación de texto — solo para clasificación, embeddings y NER.
+# Para chat hay que enrutar a través de un proveedor real: 'together',
+# 'fireworks-ai', 'novita', 'sambanova', 'cerebras', etc.
+# El catálogo de modelos disponibles por proveedor cambia seguido — si este
+# deja de funcionar, revisar el catálogo vigente en:
 # https://huggingface.co/docs/inference-providers
 HF_FALLBACK_MODEL = os.getenv(
     "HF_FALLBACK_MODEL",
-    "huggingface/hf-inference/meta-llama/Llama-3.3-70B-Instruct",
+    "huggingface/together/meta-llama/Llama-3.3-70B-Instruct",
 )
 
 # litellm espera el token de Hugging Face en la variable HF_TOKEN, pero en
@@ -100,6 +105,25 @@ def chat_completion(
 
     try:
         return litellm.completion(**kwargs)
+    except litellm.RateLimitError as e:
+        raise LLMClientError(
+            "Groq está saturado en este momento (límite de tokens por minuto "
+            "alcanzado). Esperá unos 15-20 segundos y volvé a intentar. "
+            f"Detalle técnico: {e}"
+        ) from e
+    except litellm.BadRequestError as e:
+        # Groq a veces genera una tool call mal formada (formato XML-like
+        # en vez de JSON válido, típico de function-calling estructurado
+        # bajo carga) — es transitorio en la mayoría de los casos, así que
+        # vale la pena un segundo intento antes de darse por vencido.
+        if "tool_use_failed" in str(e):
+            try:
+                return litellm.completion(**kwargs)
+            except Exception as e2:
+                raise LLMClientError(
+                    f"El modelo no pudo generar una llamada a tool válida, ni al reintentar: {e2}"
+                ) from e2
+        raise LLMClientError(f"Falló la llamada al LLM: {e}") from e
     except Exception as e:
         detalle_fallback = " (con fallback a Hugging Face incluido)" if HUGGINGFACE_API_KEY else ""
         raise LLMClientError(f"Falló la llamada al LLM{detalle_fallback}: {e}") from e

@@ -136,6 +136,37 @@ def extract_text(response: Any) -> str | None:
     return response.choices[0].message.content
 
 
+def message_to_dict(response: Any) -> dict[str, Any]:
+    """
+    Convierte el mensaje de la respuesta del LLM a un dict plano en
+    formato OpenAI/Groq, listo para guardarlo tal cual en el historial
+    de core/memory.py — necesario porque cuando el modelo pide tool
+    calls, el próximo mensaje que se le mande de vuelta tiene que incluir
+    ese mismo assistant message con sus tool_calls originales (con los
+    argumentos todavía como string JSON, sin parsear), o Groq rechaza la
+    conversación por formato inválido.
+    """
+    mensaje = response.choices[0].message
+
+    if hasattr(mensaje, "model_dump"):
+        return mensaje.model_dump()
+
+    # Fallback manual, usado en los tests con objetos simulados (donde
+    # no hay model_dump real de pydantic, como sí lo tiene litellm).
+    tool_calls_raw = getattr(mensaje, "tool_calls", None)
+    tool_calls = None
+    if tool_calls_raw:
+        tool_calls = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+            }
+            for tc in tool_calls_raw
+        ]
+    return {"role": "assistant", "content": mensaje.content, "tool_calls": tool_calls}
+
+
 if __name__ == "__main__":
     # Prueba manual — requiere GROQ_API_KEY real en el .env.
     # IMPORTANTE: este bloque no se puede correr desde el sandbox de

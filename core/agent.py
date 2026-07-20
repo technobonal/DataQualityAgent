@@ -32,6 +32,30 @@ from core.llm_client import chat_completion, extract_text, extract_tool_calls, m
 from core.memory import SessionMemory, create_session, add_message, get_llm_messages, record_action
 from tools.tool_definitions import TOOLS_SCHEMA, dispatch_tool
 
+# Cuántos elementos como máximo de una lista se le mandan al LLM dentro del
+# resultado de una tool (ej. duplicate_indices puede tener miles de filas
+# en un dataset real — el LLM solo necesita el conteo, no la lista entera).
+_MAX_ITEMS_EN_LISTA_PARA_LLM = 10
+
+
+def _recortar_para_llm(obj: Any) -> Any:
+    """
+    Recorre un resultado de tool (dict/list anidado) y recorta cualquier
+    lista con más de _MAX_ITEMS_EN_LISTA_PARA_LLM elementos, dejando una
+    nota de cuántos se omitieron. Evita gastar tokens de más en listas
+    largas (ej. índices de filas duplicadas) que el LLM no necesita ver
+    completas para explicarle el resultado al usuario — la lista completa
+    sigue disponible para Streamlit a partir del dict original sin recortar.
+    """
+    if isinstance(obj, dict):
+        return {k: _recortar_para_llm(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        if len(obj) > _MAX_ITEMS_EN_LISTA_PARA_LLM:
+            resto = len(obj) - _MAX_ITEMS_EN_LISTA_PARA_LLM
+            return obj[:_MAX_ITEMS_EN_LISTA_PARA_LLM] + [f"... y {resto} más (omitido para ahorrar tokens)"]
+        return [_recortar_para_llm(v) for v in obj]
+    return obj
+
 # Cuántas idas y vueltas de "el LLM pide una tool -> se ejecuta -> el LLM
 # ve el resultado" se permiten como máximo antes de cortar. Evita loops
 # infinitos si el modelo se queda pidiendo tools sin nunca dar una
@@ -132,10 +156,12 @@ def _ejecutar_tool_call(
             session,
             tool_name=nombre,
             arguments=argumentos,
-            result_summary=resultado,
+            result_summary=resultado,  # completo, sin recortar: esto es lo que ve Streamlit/el log de auditoría
             new_df=df_nuevo,
         )
-        contenido = resultado
+        # Al LLM sí le mandamos la versión recortada (listas largas truncadas)
+        # para no gastar tokens de más en algo que no necesita ver completo.
+        contenido = _recortar_para_llm(resultado)
     except Exception as e:
         contenido = {"error": f"La tool '{nombre}' falló: {e}"}
 

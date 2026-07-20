@@ -60,7 +60,7 @@ def chat_completion(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str = "auto",
     temperature: float = 0.2,
-    max_tokens: int = 2048,
+    max_tokens: int = 1024,
 ) -> Any:
     """
     Llama al LLM con Groq como proveedor principal y, si HUGGINGFACE_API_KEY

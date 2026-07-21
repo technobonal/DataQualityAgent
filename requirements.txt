@@ -9,6 +9,8 @@ chromadb
 langchain-chroma
 cohere
 huggingface-hub
+pypdf
+python-docx
 
 # === Análisis y calidad de datos (quality/, cleaning/, analysis/) ===
 pandas

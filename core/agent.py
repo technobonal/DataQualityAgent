@@ -32,6 +32,7 @@ from core.llm_client import chat_completion, extract_text, extract_tool_calls, m
 from core.memory import SessionMemory, create_session, add_message, get_llm_messages, record_action
 from tools.tool_definitions import TOOLS_SCHEMA, dispatch_tool
 from security.rate_limiter import RateLimiter, estimar_tokens
+from security.validators import escanear_dataframe_por_inyeccion
 
 # Cuántos elementos como máximo de una lista se le mandan al LLM dentro del
 # resultado de una tool (ej. duplicate_indices puede tener miles de filas
@@ -123,6 +124,15 @@ def run_diagnosis(session: SessionMemory) -> dict[str, Any]:
     """
     resultado, _ = dispatch_tool("diagnosticar_y_recomendar", {}, session.current_df)
 
+    # Escaneo de seguridad, una sola vez al subir el archivo: valores de
+    # celda que parezcan intentos de prompt injection (ver
+    # security/validators.py — relevante porque profiler.py incluye
+    # muestras de valores reales en los resultados que ve el LLM).
+    alertas_inyeccion = escanear_dataframe_por_inyeccion(session.current_df)
+    resultado["seguridad"] = {
+        "columnas_con_alerta": {col: r.to_dict() for col, r in alertas_inyeccion.items()},
+    }
+
     score = resultado["diagnostico"]["quality_score"]
     acciones = resultado["recomendacion"]["needed_actions"]
 
@@ -134,6 +144,13 @@ def run_diagnosis(session: SessionMemory) -> dict[str, Any]:
         )
     else:
         resumen = f"Diagnóstico inicial: score de calidad {score}/100. No encontré problemas relevantes."
+
+    if alertas_inyeccion:
+        resumen += (
+            f"\n\n⚠️ Aviso de seguridad: se encontró contenido sospechoso (posible intento de "
+            f"manipular al asistente) en {len(alertas_inyeccion)} columna(s): "
+            f"{', '.join(alertas_inyeccion.keys())}. Ese contenido va a ser tratado como dato, no como instrucción."
+        )
 
     add_message(session, role="assistant", content=resumen)
     return resultado

@@ -21,5 +21,8 @@ pandasai
 matplotlib
 seaborn
 
+# === Interfaz (app.py) ===
+streamlit
+
 # === Utilidades ===
 python-dotenv

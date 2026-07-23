@@ -1,11 +1,19 @@
 """
 core/llm_client.py
 
-Cliente unificado del LLM: habla con Groq como proveedor principal, y si
-falla (cuota agotada, error de servicio, timeout), reintenta
-automáticamente con un modelo de Hugging Face Inference Providers —
-todo a través de litellm, que expone ambos proveedores con la misma
-interfaz (formato OpenAI).
+Cliente unificado del LLM: habla con Groq como proveedor principal (o
+con Ollama local, vía el interruptor USE_LOCAL — útil para desarrollar
+sin gastar cuota de Groq), y si Groq falla (cuota agotada, error de
+servicio, timeout), reintenta automáticamente con un modelo de Hugging
+Face Inference Providers — todo a través de litellm, que expone los
+tres proveedores con la misma interfaz (formato OpenAI).
+
+USE_LOCAL=true en el .env: usa Ollama local (ollama_chat/<modelo>,
+requiere tener Ollama corriendo con el modelo ya descargado). Pensado
+para desarrollo/pruebas — no gasta tokens de Groq, pero es
+considerablemente más lento (CPU local vs. hardware especializado de Groq).
+USE_LOCAL=false (default): usa Groq — la opción rápida, para cuando
+alguien más va a usar/ver la app en vivo.
 
 Sin lógica de negocio acá — solo la conexión con el LLM. Quién decide
 qué tool llamar según la respuesta vive en core/agent.py. La memoria de
@@ -23,6 +31,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+USE_LOCAL = os.getenv("USE_LOCAL", "false").strip().lower() == "true"
+
+# --- Ollama local (solo se usa si USE_LOCAL=true) ---
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+OLLAMA_API_BASE = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 # llama-3.3-70b-versatile: 12.000 tokens/min en el free tier de Groq, contra
 # 8.000 de openai/gpt-oss-20b — más margen para un agente que manda 15 tool
@@ -39,6 +53,7 @@ HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY", "")
 # El catálogo de modelos disponibles por proveedor cambia seguido — si este
 # deja de funcionar, revisar el catálogo vigente en:
 # https://huggingface.co/docs/inference-providers
+# No se usa en modo local (USE_LOCAL=true) — Ollama no necesita fallback.
 HF_FALLBACK_MODEL = os.getenv(
     "HF_FALLBACK_MODEL",
     "huggingface/together/meta-llama/Llama-3.3-70B-Instruct",
@@ -63,10 +78,10 @@ def chat_completion(
     max_tokens: int = 1024,
 ) -> Any:
     """
-    Llama al LLM con Groq como proveedor principal y, si HUGGINGFACE_API_KEY
-    está configurada, fallback automático a Hugging Face si Groq falla
-    (cuota agotada, error 5xx, timeout, etc. — litellm decide cuándo
-    reintentar con el fallback según el tipo de error).
+    Llama al LLM. Con USE_LOCAL=true usa Ollama local (sin fallback, sin
+    costo, pero más lento). Con USE_LOCAL=false (default) usa Groq, con
+    fallback automático a Hugging Face si Groq falla (cuota agotada,
+    error 5xx, timeout, etc.) y HUGGINGFACE_API_KEY está configurada.
 
     messages: historial en formato OpenAI/Groq (ver core/memory.py ->
               get_llm_messages()).
@@ -79,16 +94,37 @@ def chat_completion(
     de OpenAI) — usar extract_text() / extract_tool_calls() para leerlo
     sin acoplarse a la estructura interna de litellm.
 
-    Lanza LLMClientError si falta la API key de Groq, o si tanto Groq
-    como el fallback (si está configurado) fallan.
+    Lanza LLMClientError si falta la config necesaria, o si la llamada
+    (y el fallback, si corresponde) fallan.
     """
+    if USE_LOCAL:
+        kwargs: dict[str, Any] = {
+            "model": f"ollama_chat/{OLLAMA_MODEL}",
+            "api_base": OLLAMA_API_BASE,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice
+
+        try:
+            return litellm.completion(**kwargs)
+        except Exception as e:
+            raise LLMClientError(
+                f"Falló la llamada a Ollama local ({OLLAMA_MODEL} en {OLLAMA_API_BASE}). "
+                f"¿Está 'ollama serve' corriendo y el modelo descargado "
+                f"(ollama pull {OLLAMA_MODEL})? Detalle: {e}"
+            ) from e
+
     if not GROQ_API_KEY:
         raise LLMClientError(
             "Falta GROQ_API_KEY en el archivo .env. Conseguila gratis en "
             "https://console.groq.com/keys"
         )
 
-    kwargs: dict[str, Any] = {
+    kwargs = {
         "model": f"groq/{GROQ_MODEL}",
         "messages": messages,
         "temperature": temperature,

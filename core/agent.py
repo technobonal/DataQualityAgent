@@ -29,7 +29,10 @@ from typing import Any
 
 import pandas as pd
 
-from core.llm_client import chat_completion, extract_text, extract_tool_calls, message_to_dict, LLMClientError
+from core.llm_client import (
+    chat_completion, extract_text, extract_tool_calls, message_to_dict,
+    LLMClientError, USE_LOCAL,
+)
 from core.memory import SessionMemory, create_session, add_message, get_llm_messages, record_action
 from tools.tool_definitions import TOOLS_SCHEMA, dispatch_tool
 from security.rate_limiter import RateLimiter, estimar_tokens
@@ -281,16 +284,18 @@ def send_message(session: SessionMemory, texto_usuario: str) -> str:
     for _ in range(_MAX_TOOL_ITERATIONS):
         llm_messages = get_llm_messages(session)
 
-        # Chequeo PREVIO del presupuesto de tokens/min — evita gastar una
-        # llamada real a Groq cuando ya sabemos que va a rebotar con 429.
-        tokens_estimados = estimar_tokens(llm_messages, tools=TOOLS_SCHEMA)
-        limiter: RateLimiter = getattr(session, "rate_limiter", None) or RateLimiter()
-        if not limiter.puede_proceder(tokens_estimados):
-            espera = limiter.tiempo_de_espera()
-            return (
-                f"Para no exceder el límite de tokens por minuto de Groq, "
-                f"esperá unos {espera:.0f} segundo(s) antes de mandar otro mensaje."
-            )
+        # Chequeo PREVIO del presupuesto de tokens/min — solo tiene sentido
+        # con Groq (que tiene un límite real de la API). En modo local
+        # (USE_LOCAL=true) no hay ningún límite externo que proteger.
+        if not USE_LOCAL:
+            tokens_estimados = estimar_tokens(llm_messages, tools=TOOLS_SCHEMA)
+            limiter: RateLimiter = getattr(session, "rate_limiter", None) or RateLimiter()
+            if not limiter.puede_proceder(tokens_estimados):
+                espera = limiter.tiempo_de_espera()
+                return (
+                    f"Para no exceder el límite de tokens por minuto de Groq, "
+                    f"esperá unos {espera:.0f} segundo(s) antes de mandar otro mensaje."
+                )
 
         try:
             response = chat_completion(

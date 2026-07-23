@@ -25,6 +25,7 @@ import streamlit as st
 
 from core.agent import create_agent_session, run_diagnosis, send_message, ingest_data_dictionary
 from core.memory import undo_last_action, reset_to_original, record_action
+from core.llm_client import USE_LOCAL
 from tools.tool_definitions import dispatch_tool
 
 st.set_page_config(page_title="DataQualityAgent", page_icon="🧹", layout="wide")
@@ -76,6 +77,10 @@ sesion = st.session_state.session
 with st.sidebar:
     st.subheader("Sesión actual")
     st.write(f"**Filas:** {len(sesion.current_df)}  |  **Columnas:** {len(sesion.current_df.columns)}")
+    if USE_LOCAL:
+        st.caption("🖥️ Modo: Ollama local (más lento, sin costo)")
+    else:
+        st.caption("☁️ Modo: Groq (rápido)")
     if st.button("🗑️ Empezar de nuevo con otro archivo"):
         st.session_state.session = None
         st.session_state.diagnostico = None
@@ -230,7 +235,12 @@ with tab_chat:
             st.write(prompt)
         with st.chat_message("assistant"):
             acciones_antes = len(sesion.actions_log)
-            with st.spinner("Pensando..."):
+            mensaje_spinner = (
+                "🧠 Analizando tu pedido (modo local — puede tardar unos segundos más)..."
+                if USE_LOCAL else
+                "🧠 Analizando tu pedido..."
+            )
+            with st.spinner(mensaje_spinner):
                 try:
                     respuesta = send_message(sesion, prompt)
                 except Exception as e:

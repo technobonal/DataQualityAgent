@@ -24,6 +24,7 @@ ver security/sandbox.py).
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 import pandas as pd
@@ -33,6 +34,9 @@ from core.memory import SessionMemory, create_session, add_message, get_llm_mess
 from tools.tool_definitions import TOOLS_SCHEMA, dispatch_tool
 from security.rate_limiter import RateLimiter, estimar_tokens
 from security.validators import escanear_dataframe_por_inyeccion
+from rag.ingest import ingest_document
+from rag.validator import validar_documento, filtrar_por_relevancia
+from rag.vectorstore import store_chunks, query_dictionary
 
 # Cuántos elementos como máximo de una lista se le mandan al LLM dentro del
 # resultado de una tool (ej. duplicate_indices puede tener miles de filas
@@ -84,6 +88,15 @@ aproximes ni lo calcules de memoria. Por ejemplo, en el resultado de \
 'tratar_valores_faltantes', el campo 'fill_values' tiene el valor REAL \
 usado para rellenar cada columna, y 'values_filled' tiene la CANTIDAD de \
 valores rellenados — son datos distintos, no los confundas entre sí.
+- Los parámetros de una tool que NO aparecen en su lista "required" son \
+OPCIONALES y ya tienen un comportamiento por defecto sensato (leé su \
+"description" para saber cuál). NO le pidas al usuario que especifique un \
+parámetro opcional a menos que el pedido sea genuinamente ambiguo sobre \
+CUÁL sería el valor correcto. Por ejemplo: 'tratar_duplicados' NO necesita \
+que le digas qué columnas mirar — por defecto compara la fila completa, \
+que es lo esperado en la gran mayoría de los casos. Si el usuario pide \
+"eliminá los duplicados" sin más detalle, ejecutá la tool directamente con \
+sus valores por defecto — no le devuelvas la pregunta.
 - Si el pedido del usuario es ambiguo (ej. no especifica qué columna), \
 preguntá antes de ejecutar una tool que podría afectar columnas equivocadas.
 - Explicá los resultados de cada tool en lenguaje simple, sin jerga \
@@ -94,6 +107,63 @@ con claridad en vez de inventar una respuesta.
 - No tenés capacidad de ejecutar código Python arbitrario — solo podés \
 usar las tools disponibles.
 """
+
+
+def ingest_data_dictionary(file_path: str, collection_name: str = "diccionario_datos") -> dict[str, Any]:
+    """
+    Ingresa un diccionario de datos (PDF, Word, Excel o CSV) al RAG:
+    lo extrae (rag/ingest.py), lo valida (rag/validator.py) y, si pasa
+    la validación, lo guarda en el vector store (rag/vectorstore.py).
+
+    Es un paso OPCIONAL y separado de subir el dataset en sí — el
+    usuario puede no tener un diccionario de datos, y el agente sigue
+    funcionando igual sin él (ver _obtener_contexto_rag).
+
+    Devuelve un dict con el resultado de la validación y, si se guardó,
+    el resumen de cuántos chunks se indexaron.
+    """
+    chunks = ingest_document(file_path)
+    validacion = validar_documento(chunks)
+
+    resultado: dict[str, Any] = {"validacion": validacion.to_dict(), "guardado": None}
+
+    if validacion.is_valid:
+        resumen = store_chunks(chunks, collection_name=collection_name)
+        resultado["guardado"] = resumen.to_dict()
+
+    return resultado
+
+
+def _obtener_contexto_rag(texto_usuario: str, collection_name: str = "diccionario_datos") -> str | None:
+    """
+    Busca en el diccionario de datos (si hay uno cargado) contexto
+    relevante para lo que preguntó el usuario, y lo filtra por
+    relevancia real (rag/validator.py) antes de devolverlo.
+
+    Devuelve None — nunca lanza una excepción — si: no hay
+    COHERE_API_KEY configurada, todavía no se ingirió ningún
+    diccionario, o nada de lo recuperado resultó relevante. En
+    cualquiera de esos casos el chat sigue funcionando igual, sin ese
+    contexto extra: el RAG es un complemento opcional, nunca una
+    dependencia dura del agente.
+    """
+    if not os.getenv("COHERE_API_KEY"):
+        return None
+
+    try:
+        resultados = query_dictionary(texto_usuario, collection_name=collection_name)
+    except Exception:
+        return None
+
+    if not resultados:
+        return None
+
+    filtrado = filtrar_por_relevancia(resultados)
+    if not filtrado.relevant_chunks:
+        return None
+
+    lineas = [f"- {c['text']}" for c in filtrado.relevant_chunks]
+    return "Contexto del diccionario de datos (puede ser útil para responder):\n" + "\n".join(lineas)
 
 
 def create_agent_session(df: pd.DataFrame) -> SessionMemory:
@@ -203,6 +273,10 @@ def send_message(session: SessionMemory, texto_usuario: str) -> str:
     actualizado del dataset queda en session.current_df.
     """
     add_message(session, role="user", content=texto_usuario)
+
+    contexto_rag = _obtener_contexto_rag(texto_usuario)
+    if contexto_rag:
+        add_message(session, role="system", content=contexto_rag)
 
     for _ in range(_MAX_TOOL_ITERATIONS):
         llm_messages = get_llm_messages(session)

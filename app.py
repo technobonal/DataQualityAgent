@@ -139,23 +139,135 @@ with tab_diagnostico:
 # ============================================================
 # TAB 2: Chat
 # ============================================================
+def _extraer_tabla_de_accion(sesion, accion) -> tuple[str, "pd.DataFrame"] | None:
+    """
+    Si una acción del agente identificó filas específicas que vale la
+    pena mostrar como tabla (ej. duplicados), la extrae. Devuelve
+    (titulo, dataframe) o None si esta acción no tiene una tabla asociada.
+    """
+    if accion.tool_name == "identificar_duplicados":
+        indices = accion.result_summary.get("duplicate_indices", [])
+        indices_validos = [i for i in indices if i in sesion.current_df.index]
+        if indices_validos:
+            titulo = f"🔁 Filas duplicadas encontradas ({len(indices_validos)}):"
+            return titulo, sesion.current_df.loc[indices_validos]
+    return None
+
+
+def _detectar_tabla_por_palabra_clave(sesion, texto_usuario: str) -> tuple[str, "pd.DataFrame"] | None:
+    """
+    No depende de que el LLM decida llamar a la tool correcta — para
+    algo tan concreto como "mostrame las filas duplicadas", conviene
+    calcularlo directo acá si el mensaje del usuario lo menciona,
+    independientemente de qué haya hecho el modelo en ese turno (a
+    veces el LLM contesta solo con texto, sin volver a llamar la tool,
+    si ya había mencionado el dato en un mensaje anterior del diagnóstico).
+    """
+    texto_lower = texto_usuario.lower()
+    if any(palabra in texto_lower for palabra in ("duplicad", "repetid")):
+        resultado, _ = dispatch_tool("identificar_duplicados", {}, sesion.current_df)
+        indices = resultado.get("duplicate_indices", [])
+        indices_validos = [i for i in indices if i in sesion.current_df.index]
+        if indices_validos:
+            titulo = f"🔁 Filas duplicadas encontradas ({len(indices_validos)}):"
+            return titulo, sesion.current_df.loc[indices_validos]
+    return None
+
+
+def _parsear_estrategia_duplicados(texto: str) -> str:
+    """Infiere la estrategia de tratar_duplicados a partir de las palabras del usuario."""
+    texto_lower = texto.lower()
+    if "última" in texto_lower or "ultima" in texto_lower:
+        return "keep_last"
+    if "todas" in texto_lower or "ninguna" in texto_lower or "remove_all" in texto_lower:
+        return "remove_all"
+    return "keep_first"  # default razonable: conservar la primera aparición
+
+
+def _ejecutar_fallback_duplicados(sesion, texto_usuario: str, tools_ya_llamadas: set) -> str | None:
+    """
+    Respaldo determinístico: si el usuario pidió eliminar duplicados y el
+    LLM NO llamó a 'tratar_duplicados' en este turno (por ejemplo, si pidió
+    aclaraciones innecesarias sobre un parámetro que en realidad es
+    opcional), lo ejecutamos directamente con una estrategia razonable
+    inferida del texto del pedido.
+    """
+    texto_lower = texto_usuario.lower()
+    pide_eliminar = any(p in texto_lower for p in ("elimin", "sacá", "saca", "borrá", "borra", "quitá", "quita"))
+    menciona_duplicados = any(p in texto_lower for p in ("duplicad", "repetid"))
+
+    if pide_eliminar and menciona_duplicados and "tratar_duplicados" not in tools_ya_llamadas:
+        strategy = _parsear_estrategia_duplicados(texto_usuario)
+        resultado, df_nuevo = dispatch_tool("tratar_duplicados", {"strategy": strategy}, sesion.current_df)
+        record_action(
+            sesion, tool_name="tratar_duplicados",
+            arguments={"strategy": strategy}, result_summary=resultado, new_df=df_nuevo,
+        )
+        return f"🔧 Ejecutado automáticamente: se eliminaron {resultado['rows_removed']} fila(s) duplicada(s) (estrategia: {strategy})."
+    return None
+
+
 with tab_chat:
-    for m in sesion.messages:
+    if "chat_tables" not in st.session_state:
+        st.session_state.chat_tables = {}
+    if "chat_fallback_msgs" not in st.session_state:
+        st.session_state.chat_fallback_msgs = {}
+
+    for idx, m in enumerate(sesion.messages):
         if m.get("role") in ("user", "assistant") and m.get("content"):
             with st.chat_message(m["role"]):
                 st.write(m["content"])
+                if idx in st.session_state.chat_tables:
+                    titulo, tabla = st.session_state.chat_tables[idx]
+                    st.caption(titulo)
+                    st.dataframe(tabla, width="stretch")
+                if idx in st.session_state.chat_fallback_msgs:
+                    st.info(st.session_state.chat_fallback_msgs[idx])
 
     prompt = st.chat_input("Escribí qué querés hacer con tus datos...")
     if prompt:
         with st.chat_message("user"):
             st.write(prompt)
         with st.chat_message("assistant"):
+            acciones_antes = len(sesion.actions_log)
             with st.spinner("Pensando..."):
                 try:
                     respuesta = send_message(sesion, prompt)
                 except Exception as e:
                     respuesta = f"Ocurrió un error inesperado: {e}"
             st.write(respuesta)
+
+            # Buscamos una tabla para mostrar por dos caminos:
+            # 1) lo que el LLM efectivamente ejecutó en este turno, y
+            # 2) un chequeo directo por palabra clave, que no depende de
+            #    que el modelo haya decidido llamar la tool correcta
+            #    (a veces no lo hace si cree que ya "sabe" la respuesta
+            #    de un mensaje anterior del diagnóstico).
+            indice_mensaje = len(sesion.messages) - 1
+            tabla_extraida = None
+
+            for accion in sesion.actions_log[acciones_antes:]:
+                tabla_extraida = _extraer_tabla_de_accion(sesion, accion)
+                if tabla_extraida:
+                    break
+
+            if not tabla_extraida:
+                tabla_extraida = _detectar_tabla_por_palabra_clave(sesion, prompt)
+
+            if tabla_extraida:
+                titulo, tabla = tabla_extraida
+                st.caption(titulo)
+                st.dataframe(tabla, width="stretch")
+                st.session_state.chat_tables[indice_mensaje] = (titulo, tabla)
+
+            # Respaldo: si pediste eliminar duplicados y el LLM no lo hizo
+            # (ej. pidió aclaraciones de más), lo ejecutamos directo acá.
+            tools_llamadas_este_turno = {a.tool_name for a in sesion.actions_log[acciones_antes:]}
+            mensaje_fallback = _ejecutar_fallback_duplicados(sesion, prompt, tools_llamadas_este_turno)
+            if mensaje_fallback:
+                st.info(mensaje_fallback)
+                st.session_state.chat_fallback_msgs[indice_mensaje] = mensaje_fallback
+        st.rerun()
         st.rerun()
 
 # ============================================================

@@ -1,19 +1,24 @@
 """
 core/llm_client.py
 
-Cliente unificado del LLM: habla con Groq como proveedor principal (o
-con Ollama local, vía el interruptor USE_LOCAL — útil para desarrollar
-sin gastar cuota de Groq), y si Groq falla (cuota agotada, error de
-servicio, timeout), reintenta automáticamente con un modelo de Hugging
-Face Inference Providers — todo a través de litellm, que expone los
-tres proveedores con la misma interfaz (formato OpenAI).
+Cliente unificado del LLM: encadena varios modelos de Groq (cada uno con
+su propia cuota de tokens/minuto separada — ver security/rate_limiter.py
+y la conversación del proyecto) y, si TODOS fallan, cae como último
+recurso a Ollama local — todo a través de litellm, que expone Groq y
+Ollama con la misma interfaz (formato OpenAI).
 
-USE_LOCAL=true en el .env: usa Ollama local (ollama_chat/<modelo>,
-requiere tener Ollama corriendo con el modelo ya descargado). Pensado
-para desarrollo/pruebas — no gasta tokens de Groq, pero es
-considerablemente más lento (CPU local vs. hardware especializado de Groq).
-USE_LOCAL=false (default): usa Groq — la opción rápida, para cuando
-alguien más va a usar/ver la app en vivo.
+Cadena de modelos (orden real, confirmado con la cuenta free de Groq):
+  1. llama-3.3-70b-versatile  (12K TPM — mejor calidad de razonamiento)
+  2. openai/gpt-oss-20b       (8K TPM  — el más rápido, ~1000 t/seg)
+  3. openai/gpt-oss-120b      (8K TPM  — más capaz que el 20b)
+  4. llama-3.1-8b-instant     (6K TPM, pero 14.4K RPD — el mayor margen diario)
+  5. ollama_chat/<modelo>     (red final, sin límite externo, pero lento)
+
+USE_LOCAL=true en el .env: se salta toda la cadena de Groq y usa
+Ollama DIRECTO — pensado para desarrollar/probar sin gastar ninguna
+cuota de Groq (aunque sea más lento). USE_LOCAL=false (default): usa la
+cadena de Groq, con Ollama como red de seguridad automática si los 4
+modelos de Groq fallan.
 
 Sin lógica de negocio acá — solo la conexión con el LLM. Quién decide
 qué tool llamar según la respuesta vive en core/agent.py. La memoria de
@@ -33,37 +38,20 @@ load_dotenv()
 
 USE_LOCAL = os.getenv("USE_LOCAL", "false").strip().lower() == "true"
 
-# --- Ollama local (solo se usa si USE_LOCAL=true) ---
+# --- Ollama local (siempre disponible como red final; único proveedor si USE_LOCAL=true) ---
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 OLLAMA_API_BASE = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-# llama-3.3-70b-versatile: 12.000 tokens/min en el free tier de Groq, contra
-# 8.000 de openai/gpt-oss-20b — más margen para un agente que manda 15 tool
-# schemas en cada llamada. Cambiar acá o en el .env si preferís otro modelo.
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY", "")
 
-# Modelo de respaldo en Hugging Face Inference Providers, formato litellm:
-#   huggingface/<provider>/<hf_org_or_user>/<hf_model>
-# IMPORTANTE: 'hf-inference' (el proveedor propio de Hugging Face) NO sirve
-# para chat/generación de texto — solo para clasificación, embeddings y NER.
-# Para chat hay que enrutar a través de un proveedor real: 'together',
-# 'fireworks-ai', 'novita', 'sambanova', 'cerebras', etc.
-# El catálogo de modelos disponibles por proveedor cambia seguido — si este
-# deja de funcionar, revisar el catálogo vigente en:
-# https://huggingface.co/docs/inference-providers
-# No se usa en modo local (USE_LOCAL=true) — Ollama no necesita fallback.
-HF_FALLBACK_MODEL = os.getenv(
-    "HF_FALLBACK_MODEL",
-    "huggingface/together/meta-llama/Llama-3.3-70B-Instruct",
-)
-
-# litellm espera el token de Hugging Face en la variable HF_TOKEN, pero en
-# nuestro .env lo llamamos HUGGINGFACE_API_KEY (más claro para el resto
-# del proyecto) -> lo adaptamos acá para no duplicar la variable.
-if HUGGINGFACE_API_KEY and not os.getenv("HF_TOKEN"):
-    os.environ["HF_TOKEN"] = HUGGINGFACE_API_KEY
+# Cadena de modelos de Groq, en orden de preferencia. Configurable vía
+# .env (GROQ_MODEL_CHAIN, separados por coma) si en algún momento cambia
+# el catálogo o los límites de tu cuenta — ver
+# https://console.groq.com/docs/models para el catálogo vigente.
+_DEFAULT_GROQ_CHAIN = "llama-3.3-70b-versatile,openai/gpt-oss-20b,openai/gpt-oss-120b,llama-3.1-8b-instant"
+GROQ_MODEL_CHAIN = [
+    m.strip() for m in os.getenv("GROQ_MODEL_CHAIN", _DEFAULT_GROQ_CHAIN).split(",") if m.strip()
+]
 
 
 class LLMClientError(Exception):
@@ -78,10 +66,18 @@ def chat_completion(
     max_tokens: int = 1024,
 ) -> Any:
     """
-    Llama al LLM. Con USE_LOCAL=true usa Ollama local (sin fallback, sin
-    costo, pero más lento). Con USE_LOCAL=false (default) usa Groq, con
-    fallback automático a Hugging Face si Groq falla (cuota agotada,
-    error 5xx, timeout, etc.) y HUGGINGFACE_API_KEY está configurada.
+    Llama al LLM.
+
+    Con USE_LOCAL=true: usa Ollama local DIRECTO, sin pasar por Groq —
+    pensado para desarrollar/probar sin gastar ninguna cuota.
+
+    Con USE_LOCAL=false (default): intenta la cadena de GROQ_MODEL_CHAIN
+    en orden (cada modelo tiene su propia cuota de tokens/minuto
+    separada en Groq, así que encadenarlos multiplica el margen
+    disponible antes de toparse con un límite real). Si TODOS los
+    modelos de Groq fallan, cae automáticamente a Ollama local como red
+    de seguridad final — litellm maneja este encadenado solo, vía el
+    parámetro 'fallbacks'.
 
     messages: historial en formato OpenAI/Groq (ver core/memory.py ->
               get_llm_messages()).
@@ -94,8 +90,8 @@ def chat_completion(
     de OpenAI) — usar extract_text() / extract_tool_calls() para leerlo
     sin acoplarse a la estructura interna de litellm.
 
-    Lanza LLMClientError si falta la config necesaria, o si la llamada
-    (y el fallback, si corresponde) fallan.
+    Lanza LLMClientError si falta la config necesaria, o si toda la
+    cadena (Groq completo + Ollama final) falla.
     """
     if USE_LOCAL:
         kwargs: dict[str, Any] = {
@@ -124,28 +120,32 @@ def chat_completion(
             "https://console.groq.com/keys"
         )
 
+    modelo_primario = f"groq/{GROQ_MODEL_CHAIN[0]}"
+    # El resto de la cadena de Groq, más Ollama al final como red de
+    # seguridad absoluta (siempre disponible, sin límite externo).
+    cadena_fallback = [f"groq/{m}" for m in GROQ_MODEL_CHAIN[1:]]
+    cadena_fallback.append(f"ollama_chat/{OLLAMA_MODEL}")
+
     kwargs = {
-        "model": f"groq/{GROQ_MODEL}",
+        "model": modelo_primario,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "num_retries": 2,
+        "fallbacks": cadena_fallback,
+        "api_base": OLLAMA_API_BASE,  # solo lo usa litellm si el fallback termina siendo ollama_chat/
     }
 
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = tool_choice
 
-    if HUGGINGFACE_API_KEY:
-        kwargs["fallbacks"] = [HF_FALLBACK_MODEL]
-
     try:
         return litellm.completion(**kwargs)
     except litellm.RateLimitError as e:
         raise LLMClientError(
-            "Groq está saturado en este momento (límite de tokens por minuto "
-            "alcanzado). Esperá unos 15-20 segundos y volvé a intentar. "
-            f"Detalle técnico: {e}"
+            f"Los {len(GROQ_MODEL_CHAIN)} modelos de Groq y Ollama local fallaron por límite de "
+            f"tokens/cuota. Esperá unos segundos y volvé a intentar. Detalle técnico: {e}"
         ) from e
     except litellm.BadRequestError as e:
         # Groq a veces genera una tool call mal formada (formato XML-like
@@ -161,8 +161,10 @@ def chat_completion(
                 ) from e2
         raise LLMClientError(f"Falló la llamada al LLM: {e}") from e
     except Exception as e:
-        detalle_fallback = " (con fallback a Hugging Face incluido)" if HUGGINGFACE_API_KEY else ""
-        raise LLMClientError(f"Falló la llamada al LLM{detalle_fallback}: {e}") from e
+        raise LLMClientError(
+            f"Falló la llamada al LLM en toda la cadena ({len(GROQ_MODEL_CHAIN)} modelos de "
+            f"Groq + Ollama local): {e}"
+        ) from e
 
 
 def extract_tool_calls(response: Any) -> list[dict[str, Any]]:

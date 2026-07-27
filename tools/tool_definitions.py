@@ -9,6 +9,14 @@ Patrón para sumar una feature nueva:
   1. Implementar la lógica en cleaning/<feature>.py (sin LLM, testeable sola)
   2. Agregar su schema a TOOLS_SCHEMA (describe cuándo debe usarla el LLM)
   3. Agregar su rama en dispatch_tool (ejecuta y devuelve JSON-serializable)
+
+FIX aplicado: 'identificar_valores_faltantes' ahora acepta min_null_pct,
+para que pedidos como "columnas con más del 60% de faltantes" filtren
+DIRECTO en la tool, en vez de depender del recorte genérico de listas
+largas en core/agent.py (_recortar_para_llm) -- que cortaba por orden
+de aparición y podía dejar afuera justo las columnas que el usuario
+pedía, si estaban después de la posición 10 en el dataset. Ver
+cleaning/missing_values.py para el detalle del fix.
 """
 
 from __future__ import annotations
@@ -38,11 +46,24 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
             "description": (
                 "Identifica y cuenta los valores faltantes por columna en el dataset "
                 "cargado por el usuario. Usar cuando pregunte cosas como "
-                "'¿qué columnas tienen datos faltantes?' o '¿cuántos nulos hay?'."
+                "'¿qué columnas tienen datos faltantes?' o '¿cuántos nulos hay?'. "
+                "El resultado viene ordenado de mayor a menor % de faltantes. Si el "
+                "usuario pide un umbral específico (ej. 'columnas con al menos 60% de "
+                "faltantes', 'más del 40% vacías'), pasar ese valor en min_null_pct "
+                "para traer SOLO esas columnas, en vez de la lista completa."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "min_null_pct": {
+                        "type": "number",
+                        "description": (
+                            "Umbral mínimo de % de faltantes (0-100) para incluir una "
+                            "columna en el resultado. Ej. 60 para 'columnas con al menos "
+                            "60% de faltantes'. Si se omite, devuelve todas las columnas."
+                        ),
+                    },
+                },
                 "required": [],
             },
         },
@@ -311,7 +332,10 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "Detecta valores atípicos (outliers) en columnas numéricas usando el "
                 "método IQR. Usar cuando el usuario pregunte '¿hay valores raros/atípicos "
                 "en mis datos?', '¿qué columnas tienen outliers?', etc. No modifica el "
-                "dataset — solo informa. Para corregirlos usar 'tratar_outliers'."
+                "dataset — solo informa. Para corregirlos usar 'tratar_outliers'. "
+                "El resultado viene ordenado de mayor a menor % de outliers. Si el usuario "
+                "pide un umbral específico (ej. 'columnas con más del 10% de outliers'), "
+                "pasar ese valor en min_outlier_pct para traer SOLO esas columnas."
             ),
             "parameters": {
                 "type": "object",
@@ -324,6 +348,14 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                     "multiplier": {
                         "type": "number",
                         "description": "Qué tan estricto es el criterio IQR. 1.5 (default) es el estándar; usar 3.0 para outliers extremos.",
+                    },
+                    "min_outlier_pct": {
+                        "type": "number",
+                        "description": (
+                            "Umbral mínimo de % de outliers (0-100) para incluir una columna "
+                            "en el resultado. Ej. 10 para 'columnas con al menos 10% de "
+                            "outliers'. Si se omite, devuelve todas las columnas numéricas."
+                        ),
                     },
                 },
                 "required": [],
@@ -429,6 +461,12 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
             "description": (
                 "Detecta filas duplicadas en el dataset, sin modificarlo. Usar cuando "
                 "el usuario pregunte '¿tengo filas repetidas?' o '¿cuántos duplicados hay?'. "
+                "El resultado incluye duplicate_groups: los valores que se repiten, "
+                "agrupados y ordenados de mayor a menor cantidad de repeticiones (ej. "
+                "'{id: 5} -> count: 4' significa que el id 5 aparece 4 veces). Preferir "
+                "duplicate_groups sobre duplicate_indices para explicarle al usuario CUÁL "
+                "valor se repite y CUÁNTAS veces. Si el usuario pide un umbral (ej. "
+                "'qué valores se repiten más de 3 veces'), pasar min_group_count. "
                 "Para eliminarlos usar 'tratar_duplicados'."
             ),
             "parameters": {
@@ -440,6 +478,14 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                         "description": (
                             "Columnas específicas para considerar al comparar filas "
                             "(ej. solo ['id', 'email']). Si se omite, compara la fila completa."
+                        ),
+                    },
+                    "min_group_count": {
+                        "type": "integer",
+                        "description": (
+                            "Umbral mínimo de repeticiones para incluir un grupo en "
+                            "duplicate_groups. Ej. 3 para 'valores que se repiten al menos "
+                            "3 veces'. Si se omite, incluye todos los grupos."
                         ),
                     },
                 },
@@ -493,7 +539,7 @@ def dispatch_tool(name: str, arguments: dict[str, Any], df: pd.DataFrame) -> tup
     caller (core/agent.py) actualizar el DataFrame en el estado de sesión.
     """
     if name == "identificar_valores_faltantes":
-        reportes = identify_missing(df)
+        reportes = identify_missing(df, min_null_pct=arguments.get("min_null_pct"))
         return [asdict(r) for r in reportes], None
 
     if name == "tratar_valores_faltantes":
@@ -518,7 +564,11 @@ def dispatch_tool(name: str, arguments: dict[str, Any], df: pd.DataFrame) -> tup
         return {"columna": arguments["column"], "case": arguments.get("case", None)}, df_nuevo
 
     if name == "identificar_duplicados":
-        reporte = identify_duplicates(df, subset=arguments.get("subset"))
+        reporte = identify_duplicates(
+            df,
+            subset=arguments.get("subset"),
+            min_group_count=arguments.get("min_group_count"),
+        )
         return reporte.to_dict(), None
 
     if name == "tratar_duplicados":
@@ -573,6 +623,7 @@ def dispatch_tool(name: str, arguments: dict[str, Any], df: pd.DataFrame) -> tup
             df,
             columns=arguments.get("columns"),
             multiplier=arguments.get("multiplier", 1.5),
+            min_outlier_pct=arguments.get("min_outlier_pct"),
         )
         return [asdict(r) for r in reportes], None
 

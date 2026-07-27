@@ -7,6 +7,20 @@ Sin dependencia de LLM — pandas puro, testeable en aislado.
 Además de los NaN "de verdad" que pandas reconoce, detecta marcadores de
 texto que en la práctica también representan un dato faltante (ej. una
 celda de Excel con "?", "N/A" o "-" en vez de estar realmente vacía).
+
+MEJORA: identify_missing() ahora acepta min_null_pct, para que el LLM
+pueda pedir directo "columnas con >=60% de faltantes" y reciba SOLO esas
+columnas, en vez de la lista completa del dataset. Antes, con datasets
+de muchas columnas, el recorte genérico de core/agent.py
+(_recortar_para_llm, que corta listas largas a los primeros 10
+elementos para no gastar tokens de más) truncaba por ORDEN DE
+APARICIÓN -- si las columnas con muchos faltantes estaban después de la
+posición 10, el LLM nunca las veía y terminaba sin poder responder.
+Además, el resultado ahora viene ORDENADO de mayor a menor % de
+faltantes por defecto: así, aunque el LLM pida el reporte SIN filtro
+(ej. "dame un resumen de nulos"), lo que sobrevive a ese mismo recorte
+genérico son las columnas más problemáticas, no las primeras 10 al
+azar.
 """
 
 from __future__ import annotations
@@ -53,10 +67,26 @@ class HandleMissingResult:
         return asdict(self)
 
 
-def identify_missing(df: pd.DataFrame) -> list[MissingReport]:
+def identify_missing(
+    df: pd.DataFrame,
+    min_null_pct: float | None = None,
+) -> list[MissingReport]:
     """
     Genera un reporte de valores faltantes por columna: nulos reales
     (NaN) + marcadores de texto que actúan como nulo disfrazado.
+
+    min_null_pct: si se pasa (0-100), devuelve SOLO las columnas cuyo
+                  null_pct sea mayor o igual a ese umbral -- para pedidos
+                  puntuales tipo "columnas con al menos 60% de faltantes".
+                  Considera tanto nulos reales como marcadores de texto
+                  como parte del % (null_pct + marker_pct combinado),
+                  ya que ambos representan un dato faltante en la práctica.
+
+    El resultado SIEMPRE viene ordenado de mayor a menor % de faltantes
+    (nulos + marcadores combinados), para que las columnas más
+    problemáticas queden primero -- relevante porque el LLM solo ve un
+    máximo de elementos por lista (ver _recortar_para_llm en
+    core/agent.py).
     """
     total = len(df)
     reportes: list[MissingReport] = []
@@ -83,6 +113,20 @@ def identify_missing(df: pd.DataFrame) -> list[MissingReport]:
                 markers_found=markers_found,
             )
         )
+
+    # % combinado (nulos reales + marcadores de texto) -- lo que el
+    # usuario percibe como "faltante" en la práctica, aunque
+    # null_pct por sí solo no lo refleje si el dato está "disfrazado"
+    # como "?", "N/A", etc.
+    def _pct_combinado(r: MissingReport) -> float:
+        if total == 0:
+            return 0.0
+        return round(((r.null_count + r.marker_count) / total) * 100, 2)
+
+    reportes.sort(key=_pct_combinado, reverse=True)
+
+    if min_null_pct is not None:
+        reportes = [r for r in reportes if _pct_combinado(r) >= min_null_pct]
 
     return reportes
 
@@ -188,23 +232,27 @@ def handle_missing_values(
 
 
 if __name__ == "__main__":
-    # Ejemplo rápido para probar el módulo de forma aislada.
-    df_ejemplo = pd.DataFrame({
-        "id": [1, 2, 3, 4, 5],
-        "edad": [22, None, 47, 35, None],
-        "ciudad": ["SP", "?", "RJ", "N/A", "SP"],
-    })
+    # Ejemplo con muchas columnas, simulando el caso real: solo un par
+    # superan el 60% de faltantes, y NO están al principio del dataset
+    # -- justo el escenario que el recorte por orden de aparición no
+    # podía resolver antes de este fix.
+    import random
+    random.seed(0)
 
-    print("--- identify_missing ---")
-    for r in identify_missing(df_ejemplo):
-        print(r)
+    columnas = {"id": list(range(1, 21))}
+    for i in range(1, 16):
+        # la mayoría con pocos o cero nulos
+        columnas[f"col_{i}"] = [random.choice([1, 2, 3, None]) if i in (11, 14) else i for i in range(20)]
+    # dos columnas al FINAL con muchísimos faltantes
+    columnas["col_muy_incompleta_1"] = [None] * 15 + [1, 2, 3, 4, 5]  # 75% nulos
+    columnas["col_muy_incompleta_2"] = [None] * 13 + [1, 2, 3, 4, 5, 6, 7]  # 65% nulos
 
-    print("\n--- handle_missing_values(strategy='mean') ---")
-    df_res, resumen = handle_missing_values(df_ejemplo, strategy="mean", columns=["edad"])
-    print(df_res)
-    print(resumen.to_dict())
+    df_ejemplo = pd.DataFrame(columnas)
 
-    print("\n--- handle_missing_values(strategy='drop_rows') ---")
-    df_res2, resumen2 = handle_missing_values(df_ejemplo, strategy="drop_rows")
-    print(df_res2)
-    print(resumen2.to_dict())
+    print("--- identify_missing SIN filtro (primeras 5 del resultado ordenado) ---")
+    for r in identify_missing(df_ejemplo)[:5]:
+        print(f"  {r.column:24s} null_pct={r.null_pct}%")
+
+    print("\n--- identify_missing CON min_null_pct=60 ---")
+    for r in identify_missing(df_ejemplo, min_null_pct=60):
+        print(f"  {r.column:24s} null_pct={r.null_pct}%")

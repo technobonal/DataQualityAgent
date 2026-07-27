@@ -8,6 +8,15 @@ Sin dependencia de LLM — pandas puro, testeable en aislado.
 
 El perfil de nulos/duplicados/tipos vive en quality/profiler.py.
 El reporte consolidado (perfil + outliers + score) vive en quality/report.py.
+
+MEJORA (mismo patrón que cleaning/missing_values.py): detect_outliers_iqr
+ahora acepta min_outlier_pct, para que pedidos tipo "columnas con más del
+X% de outliers" se filtren DIRECTO en la tool, en vez de depender del
+recorte genérico de listas largas en core/agent.py (que corta por orden
+de aparición y podía dejar afuera justo las columnas relevantes en
+datasets con muchas columnas numéricas). El resultado además viene
+SIEMPRE ordenado de mayor a menor % de outliers, como red de seguridad
+adicional para cuando no se pasa filtro.
 """
 
 from __future__ import annotations
@@ -56,15 +65,25 @@ def detect_outliers_iqr(
     df: pd.DataFrame,
     columns: list[str] | None = None,
     multiplier: float = 1.5,
+    min_outlier_pct: float | None = None,
 ) -> list[OutlierReport]:
     """
     Detecta outliers en columnas numéricas con el método IQR: cualquier
     valor fuera de [Q1 - multiplier*IQR, Q3 + multiplier*IQR] se marca
     como atípico.
 
-    columns:    columnas a revisar. Si es None, revisa todas las numéricas.
-    multiplier: qué tan estricto es el criterio. 1.5 es el estándar
-                (Tukey); usar 3.0 para detectar solo outliers "extremos".
+    columns:         columnas a revisar. Si es None, revisa todas las numéricas.
+    multiplier:       qué tan estricto es el criterio. 1.5 es el estándar
+                      (Tukey); usar 3.0 para detectar solo outliers "extremos".
+    min_outlier_pct:  si se pasa (0-100), devuelve SOLO las columnas cuyo
+                      outlier_pct sea mayor o igual a ese umbral -- para
+                      pedidos puntuales tipo "columnas con más del 10% de
+                      outliers".
+
+    El resultado SIEMPRE viene ordenado de mayor a menor outlier_pct, para
+    que las columnas más afectadas queden primero (relevante porque el
+    LLM solo ve un máximo de elementos por lista -- ver _recortar_para_llm
+    en core/agent.py).
 
     Columnas no numéricas o no encontradas se saltean silenciosamente
     (no tiene sentido buscar outliers en texto).
@@ -95,6 +114,11 @@ def detect_outliers_iqr(
                 sample_outlier_values=serie[mask].dropna().head(5).tolist(),
             )
         )
+
+    reportes.sort(key=lambda r: r.outlier_pct, reverse=True)
+
+    if min_outlier_pct is not None:
+        reportes = [r for r in reportes if r.outlier_pct >= min_outlier_pct]
 
     return reportes
 
@@ -155,22 +179,30 @@ def handle_outliers(
 
 
 if __name__ == "__main__":
-    # Ejemplo rápido para probar el módulo de forma aislada.
-    df_ejemplo = pd.DataFrame({
-        "edad": [22, 25, 47, 35, 62, 300],       # 300 es un outlier evidente
-        "salario": [3000, 3500, 8000, 5000, 12000, 11500],
-    })
+    # Ejemplo con muchas columnas numéricas, simulando el caso real: solo
+    # un par superan un umbral alto de outliers, y no están al principio.
+    import random
+    random.seed(0)
 
-    print("--- detect_outliers_iqr ---")
-    for r in detect_outliers_iqr(df_ejemplo):
-        print(r)
+    columnas: dict[str, list[Any]] = {"id": list(range(1, 31))}
+    for i in range(1, 16):
+        columnas[f"col_{i}"] = [random.uniform(10, 20) for _ in range(30)]  # sin outliers relevantes
 
-    print("\n--- handle_outliers(strategy='cap') ---")
-    df_res, resumen = handle_outliers(df_ejemplo, strategy="cap", columns=["edad"])
-    print(df_res)
+    # dos columnas al FINAL con muchos outliers evidentes
+    base = [random.uniform(10, 20) for _ in range(24)]
+    columnas["col_con_muchos_outliers_1"] = base + [500, 600, 700, 800, 900, 1000]  # 20% outliers
+    columnas["col_con_muchos_outliers_2"] = base + [-999, -888, -777, 999, 888, 777]  # 20% outliers
+
+    df_ejemplo = pd.DataFrame(columnas)
+
+    print("--- detect_outliers_iqr SIN filtro (primeras 5 del resultado ordenado) ---")
+    for r in detect_outliers_iqr(df_ejemplo)[:5]:
+        print(f"  {r.column:28s} outlier_pct={r.outlier_pct}%")
+
+    print("\n--- detect_outliers_iqr CON min_outlier_pct=15 ---")
+    for r in detect_outliers_iqr(df_ejemplo, min_outlier_pct=15):
+        print(f"  {r.column:28s} outlier_pct={r.outlier_pct}%")
+
+    print("\n--- handle_outliers(strategy='cap') sigue funcionando igual ---")
+    df_res, resumen = handle_outliers(df_ejemplo, strategy="cap", columns=["col_con_muchos_outliers_1"])
     print(resumen.to_dict())
-
-    print("\n--- handle_outliers(strategy='remove') ---")
-    df_res2, resumen2 = handle_outliers(df_ejemplo, strategy="remove", columns=["edad"])
-    print(df_res2)
-    print(resumen2.to_dict())

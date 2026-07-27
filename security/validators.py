@@ -280,4 +280,4 @@ if __name__ == "__main__":
         print(" ", r.to_dict())
 
     print("\n--- 5. NER (requiere HUGGINGFACE_API_KEY real — no testeable en el sandbox) ---")
-    print("  ner_disponible():", ner_disponible())do
+    print("  ner_disponible():", ner_disponible())

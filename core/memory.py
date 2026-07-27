@@ -1,7 +1,7 @@
 """
 core/memory.py
 
-Memoria de sesión del agente: guarda tres cosas a la vez, todas atadas a
+Memoria de sesión del agente: guarda estas cosas a la vez, todas atadas a
 la misma sesión de un usuario trabajando sobre un archivo:
 
   1. El historial de la conversación (mensajes en formato OpenAI/Groq,
@@ -9,6 +9,10 @@ la misma sesión de un usuario trabajando sobre un archivo:
   2. El estado actual del DataFrame (qué transformaciones ya se aplicaron).
   3. Un log de acciones (qué tool se llamó, con qué argumentos y qué
      resultado dio) — sirve como auditoría y para poder deshacer pasos.
+  4. Un RateLimiter propio de la sesión (security/rate_limiter.py), para
+     que el cupo de tokens/minuto de Groq no se comparta entre distintos
+     usuarios/sesiones trabajando al mismo tiempo -- cada sesión lleva
+     su propia cuenta, igual que ya pasa con current_df o messages.
 
 Sin dependencia de LLM en sí misma — es estado puro, testeable en
 aislado. llm_client.py y agent.py son quienes la usan.
@@ -21,6 +25,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
+
+from security.rate_limiter import RateLimiter
 
 # Cuántos mensajes de historial (sin contar el system prompt) se le mandan
 # al LLM como máximo. Evita que la conversación crezca sin límite y se
@@ -59,12 +65,17 @@ class SessionMemory:
     df_history:   snapshots de current_df ANTES de cada acción, para poder
                   deshacer. Limitado a _MAX_UNDO_STEPS para no consumir
                   memoria de más en datasets grandes.
+    rate_limiter: cuota de tokens/minuto de Groq propia de ESTA sesión --
+                  ver security/rate_limiter.py. default_factory=RateLimiter
+                  para que cada sesión nueva arranque con su propio
+                  presupuesto lleno, sin pisar el de otras sesiones.
     """
     original_df: pd.DataFrame
     current_df: pd.DataFrame
     messages: list[dict[str, Any]] = field(default_factory=list)
     actions_log: list[ActionRecord] = field(default_factory=list)
     df_history: list[pd.DataFrame] = field(default_factory=list)
+    rate_limiter: RateLimiter = field(default_factory=RateLimiter)
     max_history_messages: int = _MAX_HISTORY_MESSAGES
     max_undo_steps: int = _MAX_UNDO_STEPS
 
@@ -213,6 +224,9 @@ if __name__ == "__main__":
 
     print("--- mensajes para el LLM ---")
     print(get_llm_messages(sesion))
+
+    print("\n--- rate limiter propio de esta sesión ---")
+    print("Presupuesto total combinado:", sesion.rate_limiter.presupuesto_total_combinado(), "tokens/min")
 
     # Simulamos que el LLM decidió llamar a tratar_valores_faltantes
     df_nuevo = df_ejemplo.copy()

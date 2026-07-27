@@ -12,6 +12,16 @@ Dos puntos de entrada principales:
   - send_message(session, texto): el chat libre — el LLM decide qué
     tool(s) llamar según lo que pida el usuario, en lenguaje natural.
 
+FIX aplicado: session.rate_limiter ahora es un campo real de
+SessionMemory (ver core/memory.py) en vez de un atributo dinámico
+agregado acá -- ya no hace falta crearlo a mano en
+create_agent_session(). Además, el chequeo de presupuesto y el
+registro de tokens usados ya NO se hacen acá: chat_completion() (en
+core/llm_client.py) los maneja internamente por modelo, así que
+hacerlo también acá duplicaría el conteo de tokens registrados. Esto
+también corrige un bug latente: con USE_LOCAL=true, 'tokens_estimados'
+nunca se definía pero se usaba igual más abajo -> NameError.
+
 Nota de seguridad: dispatch_tool() solo puede ejecutar las 15 funciones
 ya escritas y probadas en cleaning/ y quality/ — el LLM elige CUÁL de
 esas 15 llamar y con qué argumentos, pero nunca puede hacer que se
@@ -31,11 +41,10 @@ import pandas as pd
 
 from core.llm_client import (
     chat_completion, extract_text, extract_tool_calls, message_to_dict,
-    LLMClientError, USE_LOCAL,
+    LLMClientError,
 )
 from core.memory import SessionMemory, create_session, add_message, get_llm_messages, record_action
 from tools.tool_definitions import TOOLS_SCHEMA, dispatch_tool
-from security.rate_limiter import RateLimiter, estimar_tokens
 from security.validators import escanear_dataframe_por_inyeccion
 from rag.ingest import ingest_document
 from rag.validator import validar_documento, filtrar_por_relevancia
@@ -170,13 +179,13 @@ def _obtener_contexto_rag(texto_usuario: str, collection_name: str = "diccionari
 
 
 def create_agent_session(df: pd.DataFrame) -> SessionMemory:
-    """Crea una sesión nueva para un dataset recién subido, con el system prompt del agente."""
-    session = create_session(df, system_prompt=_SYSTEM_PROMPT)
-    # Se adjunta como atributo dinámico (no un field de SessionMemory) para
-    # no acoplar core/memory.py a security/rate_limiter.py — memory.py no
-    # necesita saber que esto existe.
-    session.rate_limiter = RateLimiter()
-    return session
+    """
+    Crea una sesión nueva para un dataset recién subido, con el system
+    prompt del agente. session.rate_limiter ya viene armado de fábrica
+    (ver el default_factory en SessionMemory, core/memory.py) -- no
+    hace falta crearlo acá.
+    """
+    return create_session(df, system_prompt=_SYSTEM_PROMPT)
 
 
 def run_diagnosis(session: SessionMemory) -> dict[str, Any]:
@@ -272,6 +281,12 @@ def send_message(session: SessionMemory, texto_usuario: str) -> str:
     resultados, y repite hasta que el LLM da una respuesta final en
     texto (o hasta _MAX_TOOL_ITERATIONS, lo que pase primero).
 
+    El chequeo de presupuesto de tokens/min y el registro de uso real ya
+    NO se hacen acá -- chat_completion() (core/llm_client.py) los
+    maneja internamente, modelo por modelo, usando session.rate_limiter.
+    Si toda la cadena de Groq está sin cupo, chat_completion() cae solo
+    a Ollama local en vez de frenar acá con un mensaje de espera.
+
     Devuelve el texto final para mostrarle al usuario. El estado
     actualizado del dataset queda en session.current_df.
     """
@@ -284,33 +299,15 @@ def send_message(session: SessionMemory, texto_usuario: str) -> str:
     for _ in range(_MAX_TOOL_ITERATIONS):
         llm_messages = get_llm_messages(session)
 
-        # Chequeo PREVIO del presupuesto de tokens/min — solo tiene sentido
-        # con Groq (que tiene un límite real de la API). En modo local
-        # (USE_LOCAL=true) no hay ningún límite externo que proteger.
-        if not USE_LOCAL:
-            tokens_estimados = estimar_tokens(llm_messages, tools=TOOLS_SCHEMA)
-            limiter: RateLimiter = getattr(session, "rate_limiter", None) or RateLimiter()
-            if not limiter.puede_proceder(tokens_estimados):
-                espera = limiter.tiempo_de_espera()
-                return (
-                    f"Para no exceder el límite de tokens por minuto de Groq, "
-                    f"esperá unos {espera:.0f} segundo(s) antes de mandar otro mensaje."
-                )
-
         try:
             response = chat_completion(
                 llm_messages,
+                rate_limiter=session.rate_limiter,
                 tools=TOOLS_SCHEMA,
                 tool_choice="auto",
             )
         except LLMClientError as e:
             return f"No pude conectarme con el modelo: {e}"
-
-        # Se registra el consumo real si Groq lo informó (más preciso que
-        # la estimación previa); si no está disponible, se usa la estimación.
-        uso_real = getattr(response, "usage", None)
-        tokens_a_registrar = getattr(uso_real, "total_tokens", None) or tokens_estimados
-        limiter.registrar_uso(tokens_a_registrar)
 
         # Se guarda el mensaje del assistant tal cual lo devolvió el LLM
         # (con su tool_calls en formato OpenAI original), para que el

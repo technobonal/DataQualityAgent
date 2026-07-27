@@ -2,27 +2,19 @@
 core/llm_client.py
 
 Cliente unificado del LLM: encadena varios modelos de Groq (cada uno con
-su propia cuota de tokens/minuto separada — ver security/rate_limiter.py
-y la conversación del proyecto) y, si TODOS fallan, cae como último
-recurso a Ollama local — todo a través de litellm, que expone Groq y
-Ollama con la misma interfaz (formato OpenAI).
+su propia cuota de tokens/minuto separada) y, si TODOS fallan, cae como
+último recurso a Ollama local — todo a través de litellm.
 
-Cadena de modelos (orden real, confirmado con la cuenta free de Groq):
-  1. llama-3.3-70b-versatile  (12K TPM — mejor calidad de razonamiento)
-  2. openai/gpt-oss-20b       (8K TPM  — el más rápido, ~1000 t/seg)
-  3. openai/gpt-oss-120b      (8K TPM  — más capaz que el 20b)
-  4. llama-3.1-8b-instant     (6K TPM, pero 14.4K RPD — el mayor margen diario)
-  5. ollama_chat/<modelo>     (red final, sin límite externo, pero lento)
-
-USE_LOCAL=true en el .env: se salta toda la cadena de Groq y usa
-Ollama DIRECTO — pensado para desarrollar/probar sin gastar ninguna
-cuota de Groq (aunque sea más lento). USE_LOCAL=false (default): usa la
-cadena de Groq, con Ollama como red de seguridad automática si los 4
-modelos de Groq fallan.
-
-Sin lógica de negocio acá — solo la conexión con el LLM. Quién decide
-qué tool llamar según la respuesta vive en core/agent.py. La memoria de
-la conversación vive en core/memory.py.
+INTEGRACIÓN CON RATE LIMITER: chat_completion() ahora recibe el
+RateLimiter de la SESIÓN actual (session.rate_limiter, en
+core/memory.py) como parámetro -- no uno global del módulo. Así cada
+sesión de Streamlit lleva su propio cupo de tokens/minuto, sin
+compartirlo con otras sesiones que puedan estar corriendo al mismo
+tiempo. Antes de intentar la cadena de Groq, se le pregunta a ese
+limiter cuál es el primer modelo que todavía tiene cupo disponible, y
+se arranca por ahí -- en vez de siempre empezar por
+llama-3.3-70b-versatile y descubrir recién con un 429 que ya no tenía
+cupo.
 """
 
 from __future__ import annotations
@@ -34,20 +26,18 @@ from typing import Any
 import litellm
 from dotenv import load_dotenv
 
+from security.rate_limiter import RateLimiter, estimar_tokens
+
 load_dotenv()
 
 USE_LOCAL = os.getenv("USE_LOCAL", "false").strip().lower() == "true"
 
-# --- Ollama local (siempre disponible como red final; único proveedor si USE_LOCAL=true) ---
+# --- Ollama local ---
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 OLLAMA_API_BASE = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-# Cadena de modelos de Groq, en orden de preferencia. Configurable vía
-# .env (GROQ_MODEL_CHAIN, separados por coma) si en algún momento cambia
-# el catálogo o los límites de tu cuenta — ver
-# https://console.groq.com/docs/models para el catálogo vigente.
 _DEFAULT_GROQ_CHAIN = "llama-3.3-70b-versatile,openai/gpt-oss-20b,openai/gpt-oss-120b,llama-3.1-8b-instant"
 GROQ_MODEL_CHAIN = [
     m.strip() for m in os.getenv("GROQ_MODEL_CHAIN", _DEFAULT_GROQ_CHAIN).split(",") if m.strip()
@@ -58,55 +48,68 @@ class LLMClientError(Exception):
     """Se lanza cuando falta la API key de Groq, o cuando Groq y el fallback fallan."""
 
 
+def _call_groq(model: str, messages, tools, tool_choice, temperature, max_tokens):
+    """Una sola llamada a un modelo de Groq. Sin api_base -> usa el endpoint real de Groq."""
+    kwargs: dict[str, Any] = {
+        "model": f"groq/{model}",
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "num_retries": 2,
+    }
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = tool_choice
+    return litellm.completion(**kwargs)
+
+
+def _call_ollama(messages, tools, tool_choice, temperature, max_tokens):
+    """Una sola llamada a Ollama local. Acá SÍ corresponde api_base."""
+    kwargs: dict[str, Any] = {
+        "model": f"ollama_chat/{OLLAMA_MODEL}",
+        "api_base": OLLAMA_API_BASE,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = tool_choice
+    return litellm.completion(**kwargs)
+
+
 def chat_completion(
     messages: list[dict[str, Any]],
+    rate_limiter: RateLimiter,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str = "auto",
     temperature: float = 0.2,
     max_tokens: int = 1024,
 ) -> Any:
     """
-    Llama al LLM.
+    rate_limiter: el de la SESIÓN actual -- pasar session.rate_limiter
+                  (ver core/memory.py). Obligatorio: así cada sesión
+                  lleva su propio cupo, sin compartirlo con otras.
 
-    Con USE_LOCAL=true: usa Ollama local DIRECTO, sin pasar por Groq —
-    pensado para desarrollar/probar sin gastar ninguna cuota.
+    Con USE_LOCAL=true: Ollama local directo (sin tocar Groq, sin
+    consultar el rate limiter -- no aplica).
 
-    Con USE_LOCAL=false (default): intenta la cadena de GROQ_MODEL_CHAIN
-    en orden (cada modelo tiene su propia cuota de tokens/minuto
-    separada en Groq, así que encadenarlos multiplica el margen
-    disponible antes de toparse con un límite real). Si TODOS los
-    modelos de Groq fallan, cae automáticamente a Ollama local como red
-    de seguridad final — litellm maneja este encadenado solo, vía el
-    parámetro 'fallbacks'.
-
-    messages: historial en formato OpenAI/Groq (ver core/memory.py ->
-              get_llm_messages()).
-    tools:    TOOLS_SCHEMA de tools/tool_definitions.py, para habilitar
-              function/tool calling. None para chat libre sin tools.
-    tool_choice: 'auto' deja que el modelo decida si llama una tool o
-              responde directo en texto. Se ignora si tools es None.
-
-    Devuelve el objeto de respuesta de litellm (mismo formato que la API
-    de OpenAI) — usar extract_text() / extract_tool_calls() para leerlo
-    sin acoplarse a la estructura interna de litellm.
-
-    Lanza LLMClientError si falta la config necesaria, o si toda la
-    cadena (Groq completo + Ollama final) falla.
+    Con USE_LOCAL=false (default):
+      1. Le pregunta a rate_limiter cuál es el primer modelo de
+         GROQ_MODEL_CHAIN que todavía tiene cupo de tokens/minuto.
+      2. Si NINGÚN modelo tiene cupo en este momento, salta directo a
+         Ollama local (evita mandarle a Groq una llamada que ya
+         sabemos que va a rechazar).
+      3. Si hay un modelo con cupo, arranca la cadena por ESE modelo
+         (reordenada), y sigue con el resto como respaldo si falla por
+         otro motivo (no por cuota). Cada llamada exitosa registra su
+         gasto real en rate_limiter.
+      4. Si toda la cadena de Groq falla igual, cae a Ollama como red
+         de seguridad final.
     """
     if USE_LOCAL:
-        kwargs: dict[str, Any] = {
-            "model": f"ollama_chat/{OLLAMA_MODEL}",
-            "api_base": OLLAMA_API_BASE,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = tool_choice
-
         try:
-            return litellm.completion(**kwargs)
+            return _call_ollama(messages, tools, tool_choice, temperature, max_tokens)
         except Exception as e:
             raise LLMClientError(
                 f"Falló la llamada a Ollama local ({OLLAMA_MODEL} en {OLLAMA_API_BASE}). "
@@ -120,60 +123,59 @@ def chat_completion(
             "https://console.groq.com/keys"
         )
 
-    modelo_primario = f"groq/{GROQ_MODEL_CHAIN[0]}"
-    # El resto de la cadena de Groq, más Ollama al final como red de
-    # seguridad absoluta (siempre disponible, sin límite externo).
-    cadena_fallback = [f"groq/{m}" for m in GROQ_MODEL_CHAIN[1:]]
-    cadena_fallback.append(f"ollama_chat/{OLLAMA_MODEL}")
+    tokens_estimados = estimar_tokens(messages, tools)
+    modelo_sugerido = rate_limiter.siguiente_modelo_disponible(GROQ_MODEL_CHAIN, tokens_estimados)
 
-    kwargs = {
-        "model": modelo_primario,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "num_retries": 2,
-        "fallbacks": cadena_fallback,
-        "api_base": OLLAMA_API_BASE,  # solo lo usa litellm si el fallback termina siendo ollama_chat/
-    }
+    if modelo_sugerido is None:
+        # Toda la cadena de Groq está sin cupo ahora mismo -> directo a Ollama,
+        # sin gastar una llamada de red que ya sabemos que Groq va a rechazar.
+        try:
+            return _call_ollama(messages, tools, tool_choice, temperature, max_tokens)
+        except Exception as e:
+            raise LLMClientError(
+                f"Los {len(GROQ_MODEL_CHAIN)} modelos de Groq están sin cupo de tokens/minuto "
+                f"en este momento, y Ollama local también falló. Detalle de Ollama: {e}"
+            ) from e
 
-    if tools:
-        kwargs["tools"] = tools
-        kwargs["tool_choice"] = tool_choice
+    # Reordena la cadena para arrancar por el modelo con cupo disponible;
+    # el resto queda como respaldo si ese falla por otro motivo (no por cuota).
+    orden = [modelo_sugerido] + [m for m in GROQ_MODEL_CHAIN if m != modelo_sugerido]
+
+    ultimo_error: Exception | None = None
+
+    for modelo in orden:
+        try:
+            respuesta = _call_groq(modelo, messages, tools, tool_choice, temperature, max_tokens)
+            rate_limiter.registrar_uso(modelo, tokens_estimados)  # registra el gasto real, solo si tuvo éxito
+            return respuesta
+        except litellm.BadRequestError as e:
+            if "tool_use_failed" in str(e):
+                try:
+                    respuesta = _call_groq(modelo, messages, tools, tool_choice, temperature, max_tokens)
+                    rate_limiter.registrar_uso(modelo, tokens_estimados)
+                    return respuesta
+                except Exception as e2:
+                    ultimo_error = e2
+                    continue
+            ultimo_error = e
+            continue
+        except Exception as e:
+            ultimo_error = e
+            continue
 
     try:
-        return litellm.completion(**kwargs)
-    except litellm.RateLimitError as e:
-        raise LLMClientError(
-            f"Los {len(GROQ_MODEL_CHAIN)} modelos de Groq y Ollama local fallaron por límite de "
-            f"tokens/cuota. Esperá unos segundos y volvé a intentar. Detalle técnico: {e}"
-        ) from e
-    except litellm.BadRequestError as e:
-        # Groq a veces genera una tool call mal formada (formato XML-like
-        # en vez de JSON válido, típico de function-calling estructurado
-        # bajo carga) — es transitorio en la mayoría de los casos, así que
-        # vale la pena un segundo intento antes de darse por vencido.
-        if "tool_use_failed" in str(e):
-            try:
-                return litellm.completion(**kwargs)
-            except Exception as e2:
-                raise LLMClientError(
-                    f"El modelo no pudo generar una llamada a tool válida, ni al reintentar: {e2}"
-                ) from e2
-        raise LLMClientError(f"Falló la llamada al LLM: {e}") from e
-    except Exception as e:
+        return _call_ollama(messages, tools, tool_choice, temperature, max_tokens)
+    except Exception as e_ollama:
         raise LLMClientError(
             f"Falló la llamada al LLM en toda la cadena ({len(GROQ_MODEL_CHAIN)} modelos de "
-            f"Groq + Ollama local): {e}"
-        ) from e
+            f"Groq + Ollama local). Último error de Groq: {ultimo_error}. "
+            f"Error de Ollama: {e_ollama}"
+        ) from e_ollama
 
 
 def extract_tool_calls(response: Any) -> list[dict[str, Any]]:
     """
-    Extrae las tool calls de una respuesta del LLM, en un formato simple
-    y desacoplado de la estructura interna de litellm — lo que consume
-    core/agent.py para saber qué ejecutar.
-
-    Devuelve una lista de {"id": ..., "name": ..., "arguments": dict}.
+    Extrae las tool calls de una respuesta del LLM en formato simple.
     Lista vacía si el modelo respondió directo en texto, sin usar tools.
     """
     mensaje = response.choices[0].message
@@ -194,27 +196,20 @@ def extract_tool_calls(response: Any) -> list[dict[str, Any]]:
 
 
 def extract_text(response: Any) -> str | None:
-    """Extrae el texto de la respuesta (None si el modelo solo hizo tool calls, sin texto)."""
+    """Extrae el texto de la respuesta (None si el modelo solo hizo tool calls)."""
     return response.choices[0].message.content
 
 
 def message_to_dict(response: Any) -> dict[str, Any]:
     """
-    Convierte el mensaje de la respuesta del LLM a un dict plano en
-    formato OpenAI/Groq, listo para guardarlo tal cual en el historial
-    de core/memory.py — necesario porque cuando el modelo pide tool
-    calls, el próximo mensaje que se le mande de vuelta tiene que incluir
-    ese mismo assistant message con sus tool_calls originales (con los
-    argumentos todavía como string JSON, sin parsear), o Groq rechaza la
-    conversación por formato inválido.
+    Convierte el mensaje de la respuesta a un dict plano en formato
+    OpenAI/Groq, listo para guardar en el historial de core/memory.py.
     """
     mensaje = response.choices[0].message
 
     if hasattr(mensaje, "model_dump"):
         return mensaje.model_dump()
 
-    # Fallback manual, usado en los tests con objetos simulados (donde
-    # no hay model_dump real de pydantic, como sí lo tiene litellm).
     tool_calls_raw = getattr(mensaje, "tool_calls", None)
     tool_calls = None
     if tool_calls_raw:
@@ -230,14 +225,10 @@ def message_to_dict(response: Any) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    # Prueba manual — requiere GROQ_API_KEY real en el .env.
-    # IMPORTANTE: este bloque no se puede correr desde el sandbox de
-    # Claude (sin acceso a api.groq.com) — la lógica de parseo ya se probó
-    # con respuestas simuladas (ver conversación), pero la llamada real a
-    # Groq hay que confirmarla desde tu máquina.
+    from security.rate_limiter import RateLimiter as _RL
     mensajes = [
         {"role": "system", "content": "Sos un agente de calidad de datos, respondé breve."},
         {"role": "user", "content": "Decime 'hola' en una sola palabra."},
     ]
-    respuesta = chat_completion(mensajes)
+    respuesta = chat_completion(mensajes, rate_limiter=_RL())
     print(extract_text(respuesta))

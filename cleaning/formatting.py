@@ -9,6 +9,19 @@ Sin dependencia de LLM — pandas puro, testeable en aislado.
 auto_correct_format se apoya en quality/profiler.py (profile_column) para
 detectar automáticamente qué columnas están mal tipadas — el usuario no
 necesita indicar cuáles.
+
+MEJORA: FormatCorrectionResult ahora incluye conteos totales explícitos
+(total_processed, total_converted, total_unchanged). A diferencia de
+missing_values.py/outliers.py/duplicates.py, acá el dato más importante
+(columns_converted: qué columna se convirtió a qué tipo) es un DICT, y
+el recorte genérico de listas largas en core/agent.py
+(_recortar_para_llm) solo trunca LISTS, no dicts -- así que
+columns_converted nunca se pierde, sin importar cuántas columnas tenga.
+Lo único que sí puede truncarse son columns_processed/columns_unchanged
+(listas de nombres). Los conteos totales garantizan que, aunque esas
+listas se trunquen, el LLM siempre tenga el número exacto para responder
+"¿cuántas columnas se convirtieron/no cambiaron?" sin tener que contar
+elementos de una lista que podría estar incompleta.
 """
 
 from __future__ import annotations
@@ -31,6 +44,9 @@ class FormatCorrectionResult:
     columns_processed: list[str] = field(default_factory=list)
     columns_converted: dict[str, str] = field(default_factory=dict)  # columna -> 'numeric' | 'datetime'
     columns_unchanged: list[str] = field(default_factory=list)
+    total_processed: int = 0
+    total_converted: int = 0
+    total_unchanged: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Serializa a dict plano — lo que tool_definitions.py le devuelve al LLM."""
@@ -70,6 +86,10 @@ def auto_correct_format(
             resultado.columns_converted[col] = "datetime"
         else:
             resultado.columns_unchanged.append(col)
+
+    resultado.total_processed = len(resultado.columns_processed)
+    resultado.total_converted = len(resultado.columns_converted)
+    resultado.total_unchanged = len(resultado.columns_unchanged)
 
     return df_nuevo, resultado
 
@@ -138,23 +158,30 @@ def clean_text_column(
 
 
 if __name__ == "__main__":
-    # Ejemplo rápido para probar el módulo de forma aislada.
-    df_ejemplo = pd.DataFrame({
-        " Nombre Cliente ": ["  ana  ", "LUIS", "marta "],
-        "Monto ($)": ["100.5", "200", "50.25"],
-        "Fecha Registro": ["2024-01-15", "2024-01-16", "2024-02-01"],
-    })
+    # Ejemplo con muchas columnas (más de 10) para confirmar que
+    # total_converted/total_unchanged quedan exactos aunque las listas
+    # columns_processed/columns_unchanged se trunquen después, en el
+    # recorte genérico de core/agent.py (que acá no corremos, pero los
+    # totales ya vienen resueltos de antes).
+    columnas = {}
+    for i in range(1, 13):
+        columnas[f"num_como_texto_{i}"] = ["1", "2", "3"]  # todas numeric_as_text
+    columnas["texto_libre"] = ["hola", "chau", "che"]  # queda sin cambios
 
-    print("--- auto_correct_format ---")
+    df_ejemplo = pd.DataFrame(columnas)
+
+    print("--- auto_correct_format con 13 columnas ---")
     df_res, resumen = auto_correct_format(df_ejemplo)
-    print(df_res.dtypes)
-    print(resumen.to_dict())
+    print(f"total_processed={resumen.total_processed}  "
+          f"total_converted={resumen.total_converted}  "
+          f"total_unchanged={resumen.total_unchanged}")
+    print(f"columns_converted (dict completo, NUNCA se trunca): {len(resumen.columns_converted)} entradas")
 
     print("\n--- clean_column_names ---")
-    df_res2, cambios = clean_column_names(df_res)
+    df_ejemplo2 = pd.DataFrame({
+        " Nombre Cliente ": ["  ana  ", "LUIS", "marta "],
+        "Monto ($)": ["100.5", "200", "50.25"],
+    })
+    df_res2, cambios = clean_column_names(df_ejemplo2)
     print(df_res2.columns.tolist())
     print(cambios)
-
-    print("\n--- clean_text_column (case='title') ---")
-    df_res3 = clean_text_column(df_res2, column="nombre_cliente", case="title")
-    print(df_res3)

@@ -8,19 +8,17 @@ Además de los NaN "de verdad" que pandas reconoce, detecta marcadores de
 texto que en la práctica también representan un dato faltante (ej. una
 celda de Excel con "?", "N/A" o "-" en vez de estar realmente vacía).
 
-MEJORA: identify_missing() ahora acepta min_null_pct, para que el LLM
-pueda pedir directo "columnas con >=60% de faltantes" y reciba SOLO esas
-columnas, en vez de la lista completa del dataset. Antes, con datasets
-de muchas columnas, el recorte genérico de core/agent.py
-(_recortar_para_llm, que corta listas largas a los primeros 10
-elementos para no gastar tokens de más) truncaba por ORDEN DE
-APARICIÓN -- si las columnas con muchos faltantes estaban después de la
-posición 10, el LLM nunca las veía y terminaba sin poder responder.
-Además, el resultado ahora viene ORDENADO de mayor a menor % de
-faltantes por defecto: así, aunque el LLM pida el reporte SIN filtro
-(ej. "dame un resumen de nulos"), lo que sobrevive a ese mismo recorte
-genérico son las columnas más problemáticas, no las primeras 10 al
-azar.
+MEJORAS:
+- min_null_pct + orden por relevancia (mayor % de faltantes primero) --
+  ver versión anterior de este archivo.
+- NUEVO: cada MissingReport ahora incluye row_indices -- los índices de
+  fila donde ESA columna tiene un nulo real o un marcador ("N/A", "?",
+  etc.). Mismo patrón que duplicate_indices en identify_duplicates
+  (cleaning/duplicates.py). Antes, "mostrame las filas con nulos" no se
+  podía resolver: la tool no guardaba NINGÚN índice de fila, solo
+  conteos por columna -- a diferencia de duplicados, que sí lo tenía
+  desde el principio. Con esto, ui/chat_tab.py ya puede armar la tabla
+  de filas con faltantes, igual que ya hace con duplicados.
 """
 
 from __future__ import annotations
@@ -50,6 +48,7 @@ class MissingReport:
     null_pct: float
     marker_count: int = 0  # valores tipo "?", "N/A" que funcionan como nulo pero no lo son técnicamente
     markers_found: list[str] = field(default_factory=list)
+    row_indices: list[int] = field(default_factory=list)  # filas con nulo real O marcador, en ESTA columna
 
 
 @dataclass
@@ -82,6 +81,10 @@ def identify_missing(
                   como parte del % (null_pct + marker_pct combinado),
                   ya que ambos representan un dato faltante en la práctica.
 
+    row_indices, por columna: los índices de fila donde ESA columna
+    específica tiene un nulo real o un marcador -- útil para armar una
+    tabla ("mostrame las filas con nulos en la columna X").
+
     El resultado SIEMPRE viene ordenado de mayor a menor % de faltantes
     (nulos + marcadores combinados), para que las columnas más
     problemáticas queden primero -- relevante porque el LLM solo ve un
@@ -93,16 +96,25 @@ def identify_missing(
 
     for col in df.columns:
         serie = df[col]
-        null_count = int(serie.isna().sum())
+        null_mask = serie.isna()
+        null_count = int(null_mask.sum())
         marker_count = 0
         markers_found: list[str] = []
+        marker_mask = pd.Series(False, index=serie.index)
 
         if pd.api.types.is_object_dtype(serie) or pd.api.types.is_string_dtype(serie):
             no_nulos = serie.dropna().astype(str).str.strip().str.lower()
-            mask_markers = no_nulos.isin(_MISSING_MARKERS)
-            marker_count = int(mask_markers.sum())
+            mask_markers_no_nulos = no_nulos.isin(_MISSING_MARKERS)
+            marker_count = int(mask_markers_no_nulos.sum())
             if marker_count:
-                markers_found = sorted(no_nulos[mask_markers].unique().tolist())
+                markers_found = sorted(no_nulos[mask_markers_no_nulos].unique().tolist())
+                # Reconstruye la máscara sobre el índice completo de la serie
+                # (no_nulos ya perdió las filas nulas al hacer dropna()).
+                marker_mask = serie.index.isin(no_nulos[mask_markers_no_nulos].index)
+                marker_mask = pd.Series(marker_mask, index=serie.index)
+
+        fila_con_faltante = null_mask | marker_mask
+        row_indices = serie.index[fila_con_faltante].tolist()
 
         reportes.append(
             MissingReport(
@@ -111,6 +123,7 @@ def identify_missing(
                 null_pct=round((null_count / total * 100) if total else 0.0, 2),
                 marker_count=marker_count,
                 markers_found=markers_found,
+                row_indices=row_indices,
             )
         )
 
@@ -232,27 +245,16 @@ def handle_missing_values(
 
 
 if __name__ == "__main__":
-    # Ejemplo con muchas columnas, simulando el caso real: solo un par
-    # superan el 60% de faltantes, y NO están al principio del dataset
-    # -- justo el escenario que el recorte por orden de aparición no
-    # podía resolver antes de este fix.
-    import random
-    random.seed(0)
+    df_ejemplo = pd.DataFrame({
+        "id": [1, 2, 3, 4, 5],
+        "edad": [22, None, 47, 35, None],
+        "ciudad": ["SP", "?", "RJ", "N/A", "SP"],
+    })
 
-    columnas = {"id": list(range(1, 21))}
-    for i in range(1, 16):
-        # la mayoría con pocos o cero nulos
-        columnas[f"col_{i}"] = [random.choice([1, 2, 3, None]) if i in (11, 14) else i for i in range(20)]
-    # dos columnas al FINAL con muchísimos faltantes
-    columnas["col_muy_incompleta_1"] = [None] * 15 + [1, 2, 3, 4, 5]  # 75% nulos
-    columnas["col_muy_incompleta_2"] = [None] * 13 + [1, 2, 3, 4, 5, 6, 7]  # 65% nulos
+    print("--- identify_missing (con row_indices) ---")
+    for r in identify_missing(df_ejemplo):
+        print(f"  {r.column:10s} null_pct={r.null_pct}%  row_indices={r.row_indices}  markers={r.markers_found}")
 
-    df_ejemplo = pd.DataFrame(columnas)
-
-    print("--- identify_missing SIN filtro (primeras 5 del resultado ordenado) ---")
-    for r in identify_missing(df_ejemplo)[:5]:
-        print(f"  {r.column:24s} null_pct={r.null_pct}%")
-
-    print("\n--- identify_missing CON min_null_pct=60 ---")
-    for r in identify_missing(df_ejemplo, min_null_pct=60):
-        print(f"  {r.column:24s} null_pct={r.null_pct}%")
+    print("\n--- handle_missing_values(strategy='mean') sigue igual ---")
+    df_res, resumen = handle_missing_values(df_ejemplo, strategy="mean", columns=["edad"])
+    print(resumen.to_dict())

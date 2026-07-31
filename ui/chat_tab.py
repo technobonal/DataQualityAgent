@@ -7,6 +7,12 @@ Incluye lógica de:
   - Extracción de tablas de resultados de tools (ej. duplicados)
   - Detección por palabra clave (fallback si el LLM no llama la tool)
   - Fallback determinístico para eliminar duplicados
+
+NUEVO: las tablas que se muestran en el chat ahora usan
+render_dataframe_con_buscador() (ui/components.py) en vez de
+st.dataframe directo -- agrega el selector de columna por nombre.
+Cada tabla necesita una key única (usamos el índice del mensaje al que
+pertenece, que ya es único dentro de la sesión).
 """
 
 from __future__ import annotations
@@ -18,34 +24,66 @@ from core.llm_client import USE_LOCAL
 from core.memory import record_action
 from tools.tool_definitions import dispatch_tool
 from ui.state import StateManager
-from quality.profiler import make_arrow_safe
-
+from ui.components import render_dataframe_con_buscador
 
 
 # ─── Helpers ─────────────────────────────────────────────────
 
 def _extraer_tabla_de_accion(sesion, accion) -> tuple[str, "pd.DataFrame"] | None:
-    """
-    Si una acción del agente identificó filas específicas que vale la
-    pena mostrar como tabla (ej. duplicados), la extrae. Devuelve
-    (titulo, dataframe) o None si esta acción no tiene una tabla asociada.
-    """
     if accion.tool_name == "identificar_duplicados":
         indices = accion.result_summary.get("duplicate_indices", [])
         indices_validos = [i for i in indices if i in sesion.current_df.index]
         if indices_validos:
             titulo = f"🔁 Filas duplicadas encontradas ({len(indices_validos)}):"
             return titulo, sesion.current_df.loc[indices_validos]
+
+    if accion.tool_name == "identificar_valores_faltantes":
+        reportes = accion.result_summary or []
+        indices_unidos: list[int] = []
+        columnas_con_nulos: list[str] = []          # <- nuevo
+        for r in reportes:
+            indices_unidos.extend(r.get("row_indices", []))
+            if r.get("row_indices"):                # <- nuevo: solo columnas que aportaron algún índice
+                columnas_con_nulos.append(r["column"])
+        indices_validos = sorted(set(i for i in indices_unidos if i in sesion.current_df.index))
+        if indices_validos:
+            titulo = f"🕳️ Filas con valores faltantes encontradas ({len(indices_validos)}):"
+            # antes: sesion.current_df.loc[indices_validos]  -- todas las columnas
+            return titulo, sesion.current_df.loc[indices_validos, columnas_con_nulos]
+
+    return None
+
+def _detectar_tabla_faltantes_por_columna(sesion, texto_usuario: str) -> tuple[str, "pd.DataFrame"] | None:
+    """
+    Si el usuario menciona el nombre de una columna concreta junto con
+    palabras de "faltante/nulo" (ej. "mostrame las filas con nulos en
+    edad"), filtra la tabla a SOLO esa columna, en vez de todas.
+    """
+    texto_lower = texto_usuario.lower()
+    if not any(palabra in texto_lower for palabra in ("nulo", "faltante", "vacío", "vacio", "n/a")):
+        return None
+
+    for col in sesion.current_df.columns:
+        if str(col).lower() in texto_lower:
+            resultado, _ = dispatch_tool("identificar_valores_faltantes", {}, sesion.current_df)
+            reporte_columna = next((r for r in resultado if r["column"] == col), None)
+            if reporte_columna and reporte_columna["row_indices"]:
+                indices_validos = [i for i in reporte_columna["row_indices"] if i in sesion.current_df.index]
+                if indices_validos:
+                    titulo = f"🕳️ Filas con valores faltantes en '{col}' ({len(indices_validos)}):"
+                    return titulo, sesion.current_df.loc[indices_validos, [col]]
     return None
 
 
 def _detectar_tabla_por_palabra_clave(sesion, texto_usuario: str) -> tuple[str, "pd.DataFrame"] | None:
     """
     No depende de que el LLM decida llamar a la tool correcta — para
-    algo tan concreto como "mostrame las filas duplicadas", conviene
-    calcularlo directo acá si el mensaje del usuario lo menciona.
+    algo tan concreto como "mostrame las filas duplicadas" o "mostrame
+    las filas con nulos", conviene calcularlo directo acá si el mensaje
+    del usuario lo menciona.
     """
     texto_lower = texto_usuario.lower()
+
     if any(palabra in texto_lower for palabra in ("duplicad", "repetid")):
         resultado, _ = dispatch_tool("identificar_duplicados", {}, sesion.current_df)
         indices = resultado.get("duplicate_indices", [])
@@ -53,6 +91,27 @@ def _detectar_tabla_por_palabra_clave(sesion, texto_usuario: str) -> tuple[str, 
         if indices_validos:
             titulo = f"🔁 Filas duplicadas encontradas ({len(indices_validos)}):"
             return titulo, sesion.current_df.loc[indices_validos]
+
+    # Nulos/faltantes: primero se intenta por columna específica (más
+    # preciso); si el usuario no mencionó ninguna columna, se muestran
+    # todas las filas con algún faltante, en cualquier columna.
+    if any(palabra in texto_lower for palabra in ("nulo", "faltante", "vacío", "vacio")):
+        tabla_por_columna = _detectar_tabla_faltantes_por_columna(sesion, texto_usuario)
+        if tabla_por_columna:
+            return tabla_por_columna
+
+        resultado, _ = dispatch_tool("identificar_valores_faltantes", {}, sesion.current_df)
+        indices_unidos: list[int] = []
+        columnas_con_nulos: list[str] = []          # <- nuevo
+        for r in resultado:
+            indices_unidos.extend(r.get("row_indices", []))
+            if r.get("row_indices"):                # <- nuevo
+                columnas_con_nulos.append(r["column"])
+        indices_validos = sorted(set(i for i in indices_unidos if i in sesion.current_df.index))
+        if indices_validos:
+            titulo = f"🕳️ Filas con valores faltantes encontradas ({len(indices_validos)}):"
+            return titulo, sesion.current_df.loc[indices_validos, columnas_con_nulos]
+
     return None
 
 
@@ -108,12 +167,21 @@ def render(manager: StateManager) -> None:
                 if idx in chat_tables:
                     titulo, tabla = chat_tables[idx]
                     st.caption(titulo)
-                    st.dataframe(make_arrow_safe(tabla), width="stretch")
+                    render_dataframe_con_buscador(tabla, key=f"chat_tabla_historial_{idx}",
+                                                  resaltar_nulos=titulo.startswith("🕳️"),  # <- nuevo
+                    )
                 if idx in chat_fallbacks:
                     st.info(chat_fallbacks[idx])
 
     # Input de nuevo mensaje
     prompt = st.chat_input("Escribí qué querés hacer con tus datos…")
+    
+    # 💬 NOTA PERMANENTE AL PIE DEL CHAT
+    st.markdown(
+        '<p class="chat-disclaimer">DataqualityAgent es una IA y puede cometer errores.</p>',
+        unsafe_allow_html=True
+    )
+
     if prompt:
         with st.chat_message("user"):
             st.write(prompt)
@@ -147,7 +215,10 @@ def render(manager: StateManager) -> None:
             if tabla_extraida:
                 titulo, tabla = tabla_extraida
                 st.caption(titulo)
-                st.dataframe(make_arrow_safe(tabla), width="stretch")
+                render_dataframe_con_buscador(
+                    tabla, key=f"chat_tabla_nueva_{indice_mensaje}",
+                    resaltar_nulos=titulo.startswith("🕳️"),
+                )
                 manager.set_chat_table(indice_mensaje, titulo, tabla)
 
             # Respaldo: si pidió eliminar duplicados y el LLM no lo hizo

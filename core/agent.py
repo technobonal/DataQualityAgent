@@ -12,15 +12,15 @@ Dos puntos de entrada principales:
   - send_message(session, texto): el chat libre — el LLM decide qué
     tool(s) llamar según lo que pida el usuario, en lenguaje natural.
 
-FIX aplicado: session.rate_limiter ahora es un campo real de
-SessionMemory (ver core/memory.py) en vez de un atributo dinámico
-agregado acá -- ya no hace falta crearlo a mano en
-create_agent_session(). Además, el chequeo de presupuesto y el
-registro de tokens usados ya NO se hacen acá: chat_completion() (en
-core/llm_client.py) los maneja internamente por modelo, así que
-hacerlo también acá duplicaría el conteo de tokens registrados. Esto
-también corrige un bug latente: con USE_LOCAL=true, 'tokens_estimados'
-nunca se definía pero se usaba igual más abajo -> NameError.
+NUEVO: send_message() acepta un on_status opcional -- un callback
+Callable[[str], None] que se dispara ANTES de cada llamada al LLM, con
+un mensaje ya armado en español según lo que predecir_proveedor()
+(core/llm_client.py) anticipa que va a pasar. Así la UI (ui/chat_tab.py)
+puede avisarle al usuario "esto va a tardar más, cayendo a Ollama
+local" ANTES de la espera larga, en vez de mostrar siempre el mismo
+spinner genérico y que parezca que la app se colgó -- como pasó hoy
+cuando la cadena de Groq se quedó sin cupo y cayó a qwen2.5:7b sin
+ningún aviso.
 
 Nota de seguridad: dispatch_tool() solo puede ejecutar las 15 funciones
 ya escritas y probadas en cleaning/ y quality/ — el LLM elige CUÁL de
@@ -35,15 +35,15 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
 from core.llm_client import (
     chat_completion, extract_text, extract_tool_calls, message_to_dict,
-    LLMClientError,
+    predecir_proveedor, LLMClientError,
 )
-from core.memory import SessionMemory, create_session, add_message, get_llm_messages, record_action
+from core.memory import SessionMemory, create_session, add_message, get_llm_messages, record_action, compact_completed_turn
 from tools.tool_definitions import TOOLS_SCHEMA, dispatch_tool
 from security.validators import escanear_dataframe_por_inyeccion
 from rag.ingest import ingest_document
@@ -91,6 +91,15 @@ variables indicadoras, identificar y tratar outliers, y generar un \
 diagnóstico de calidad con recomendaciones.
 
 Reglas importantes:
+- El dataset del usuario YA ESTÁ CARGADO y disponible para vos a través \
+de las tools — nunca le pidas al usuario que te copie, pegue o liste \
+manualmente columnas, filas o valores. Si preguntan algo sobre el \
+dataset (qué columnas hay, cuáles tienen el tipo correcto/incorrecto, \
+cuáles tienen problemas, qué filas están afectadas), respondé llamando \
+a la tool que corresponda (identificar_valores_faltantes, \
+identificar_outliers, identificar_duplicados, generar_reporte_calidad, \
+diagnosticar_y_recomendar) — NUNCA le pidas al usuario que te pase esa \
+información, porque vos ya podés consultarla directamente.
 - Usá SIEMPRE una tool para ejecutar una acción sobre los datos. Nunca \
 inventes que "ya lo hiciste" sin haber llamado a la tool correspondiente.
 - CRÍTICO: cuando menciones un valor numérico específico (un promedio, un \
@@ -119,6 +128,17 @@ con claridad en vez de inventar una respuesta.
 - No tenés capacidad de ejecutar código Python arbitrario — solo podés \
 usar las tools disponibles.
 """
+
+# Mensajes en español para on_status, según lo que predecir_proveedor()
+# anticipa antes de cada llamada -- ver send_message().
+_MENSAJES_PROVEEDOR = {
+    "groq": "🧠 Analizando tu pedido (Groq)…",
+    "local": "🐢 Analizando tu pedido (modo local — puede tardar unos minutos)…",
+    "local_fallback": (
+        "🐢 Groq sin cupo disponible en este momento — usando el modelo local "
+        "como respaldo (puede tardar 1-2 minutos)…"
+    ),
+}
 
 
 def ingest_data_dictionary(file_path: str, collection_name: str = "diccionario_datos") -> dict[str, Any]:
@@ -273,13 +293,26 @@ def _ejecutar_tool_call(
     return json.dumps(contenido, ensure_ascii=False, default=str)
 
 
-def send_message(session: SessionMemory, texto_usuario: str) -> str:
+def send_message(
+    session: SessionMemory,
+    texto_usuario: str,
+    on_status: Callable[[str], None] | None = None,
+) -> str:
     """
     Punto de entrada del chat libre: agrega el mensaje del usuario al
     historial, le pregunta a Groq qué hacer (con las 15 tools
     disponibles), ejecuta las tools que el LLM pida, le devuelve los
     resultados, y repite hasta que el LLM da una respuesta final en
     texto (o hasta _MAX_TOOL_ITERATIONS, lo que pase primero).
+
+    on_status: callback opcional que se llama ANTES de cada llamada al
+               LLM, con un mensaje en español ya armado según lo que
+               predecir_proveedor() anticipa (Groq rápido, local
+               forzado, o fallback local por falta de cupo en Groq).
+               Pensado para que ui/chat_tab.py actualice el spinner
+               dinámicamente ANTES de la espera larga, en vez de
+               mostrar siempre el mismo texto genérico. Si es None, no
+               se avisa nada (comportamiento anterior).
 
     El chequeo de presupuesto de tokens/min y el registro de uso real ya
     NO se hacen acá -- chat_completion() (core/llm_client.py) los
@@ -299,6 +332,10 @@ def send_message(session: SessionMemory, texto_usuario: str) -> str:
     for _ in range(_MAX_TOOL_ITERATIONS):
         llm_messages = get_llm_messages(session)
 
+        if on_status is not None:
+            proveedor, _detalle = predecir_proveedor(llm_messages, session.rate_limiter, tools=TOOLS_SCHEMA)
+            on_status(_MENSAJES_PROVEEDOR.get(proveedor, "🧠 Analizando tu pedido…"))
+
         try:
             response = chat_completion(
                 llm_messages,
@@ -316,8 +353,10 @@ def send_message(session: SessionMemory, texto_usuario: str) -> str:
 
         tool_calls = extract_tool_calls(response)
         if not tool_calls:
-            return extract_text(response) or ""
-
+            texto_final = extract_text(response) or ""
+            compact_completed_turn(session)   # <- nuevo, antes de devolver
+            return texto_final
+        
         for tc in tool_calls:
             contenido_tool = _ejecutar_tool_call(session, tc)
             add_message(
@@ -351,8 +390,12 @@ if __name__ == "__main__":
     diagnostico = run_diagnosis(sesion)
     print(f"Score: {diagnostico['diagnostico']['quality_score']}")
 
-    print("\n=== Chat libre ===")
-    respuesta = send_message(sesion, "Rellename los nulos de edad con la media, por favor")
+    print("\n=== Chat libre (con on_status) ===")
+    respuesta = send_message(
+        sesion,
+        "Rellename los nulos de edad con la media, por favor",
+        on_status=lambda msg: print(f"[status] {msg}"),
+    )
     print(respuesta)
     print("\nDataset actual:")
     print(sesion.current_df)

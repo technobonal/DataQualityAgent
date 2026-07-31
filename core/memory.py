@@ -16,6 +16,34 @@ la misma sesión de un usuario trabajando sobre un archivo:
 
 Sin dependencia de LLM en sí misma — es estado puro, testeable en
 aislado. llm_client.py y agent.py son quienes la usan.
+
+OPTIMIZACIÓN DE VELOCIDAD (histórica): _MAX_HISTORY_MESSAGES bajó de 20
+a 8. Con Ollama local en CPU, el tiempo de espera está dominado por
+cuánto tarda el modelo en LEER el prompt completo -- un historial largo
+se vuelve a leer entero en CADA turno.
+
+OPTIMIZACIÓN DE TOKENS (nueva): compact_completed_turn().
+El problema real no era solo la CANTIDAD de mensajes, sino su PESO: cada
+turno donde el LLM llama tools deja en el historial el mensaje
+'assistant' con tool_calls MÁS el JSON completo de cada resultado de
+tool (aunque ya recortado por _recortar_para_llm en agent.py, un
+diagnóstico o reporte de calidad completo sigue siendo pesado). Ese
+JSON crudo solo hace falta DENTRO del turno en que se generó, para que
+el LLM pueda redactar su respuesta final en texto -- una vez que esa
+respuesta en texto ya existe, los turnos futuros no necesitan releer el
+JSON: la respuesta en texto ya resume lo que importa.
+
+compact_completed_turn() reemplaza, al cerrar un turno, la secuencia
+[user, assistant+tool_calls, tool, tool, ..., assistant(texto final)]
+por simplemente [user, assistant(texto final)] -- msmo contenido
+semántico para el usuario, sin el peso del JSON intermedio. Se llama al
+final de agent.send_message(), después de tener la respuesta final.
+
+Además, get_llm_messages() ahora recorta respetando los límites de cada
+turno (nunca corta un tool_call de su respuesta), en vez de cortar por
+posición fija -- evita mandar un mensaje 'tool' huérfano, que Groq
+rechaza con error 400 por no tener su 'assistant' correspondiente
+inmediatamente antes en la secuencia.
 """
 
 from __future__ import annotations
@@ -28,10 +56,12 @@ import pandas as pd
 
 from security.rate_limiter import RateLimiter
 
-# Cuántos mensajes de historial (sin contar el system prompt) se le mandan
-# al LLM como máximo. Evita que la conversación crezca sin límite y se
-# coma el context window / la cuota de tokens.
-_MAX_HISTORY_MESSAGES = 20
+# Cuántos TURNOS completos (no mensajes sueltos) de historial se le mandan
+# al LLM como máximo. Un turno = todo lo que pasó desde un mensaje 'user'
+# hasta la siguiente respuesta final del assistant. Contar por turnos (y
+# no por mensajes sueltos) es lo que evita partir un intercambio de tool
+# calling por la mitad.
+_MAX_HISTORY_TURNS = 4
 
 # Cuántos snapshots del DataFrame se guardan para poder deshacer pasos.
 _MAX_UNDO_STEPS = 10
@@ -62,6 +92,9 @@ class SessionMemory:
                   ({"role": ..., "content": ...}, con tool_calls/tool_call_id
                   cuando corresponda).
     actions_log:  qué se le hizo al dataset, en orden, para auditoría y undo.
+                  NO se toca con compact_completed_turn() -- el log de
+                  auditoría siempre queda completo, sin recortar; lo único
+                  que se compacta es lo que se le vuelve a mandar al LLM.
     df_history:   snapshots de current_df ANTES de cada acción, para poder
                   deshacer. Limitado a _MAX_UNDO_STEPS para no consumir
                   memoria de más en datasets grandes.
@@ -76,7 +109,7 @@ class SessionMemory:
     actions_log: list[ActionRecord] = field(default_factory=list)
     df_history: list[pd.DataFrame] = field(default_factory=list)
     rate_limiter: RateLimiter = field(default_factory=RateLimiter)
-    max_history_messages: int = _MAX_HISTORY_MESSAGES
+    max_history_turns: int = _MAX_HISTORY_TURNS
     max_undo_steps: int = _MAX_UNDO_STEPS
 
 
@@ -123,25 +156,94 @@ def add_message(
     session.messages.append(mensaje)
 
 
+def _indices_inicio_de_turno(mensajes: list[dict[str, Any]]) -> list[int]:
+    """
+    Devuelve, en orden, el índice de cada mensaje 'user' dentro de
+    `mensajes` -- cada uno marca el arranque de un turno nuevo. Se usa
+    tanto para recortar por turnos completos (get_llm_messages) como
+    para ubicar el turno más reciente a compactar (compact_completed_turn).
+    """
+    return [i for i, m in enumerate(mensajes) if m.get("role") == "user"]
+
+
 def get_llm_messages(session: SessionMemory) -> list[dict[str, Any]]:
     """
     Devuelve los mensajes a enviar al LLM, recortando el historial si es
     muy largo. Si el primer mensaje es el system prompt, se conserva
-    siempre (no cuenta contra el límite) y se recortan solo los mensajes
-    de conversación más viejos.
+    siempre (no cuenta contra el límite).
+
+    El recorte es por TURNOS completos (desde un 'user' hasta el próximo
+    'user', o el final), nunca por posición fija de mensaje -- así nunca
+    se corta un 'assistant' con tool_calls de su(s) mensaje(s) 'tool'
+    correspondientes, que Groq rechazaría por venir sin su tool_call
+    original en la misma request.
     """
     if not session.messages:
         return []
 
     if session.messages[0].get("role") == "system":
         system_msg, resto = session.messages[0], session.messages[1:]
-        if len(resto) > session.max_history_messages:
-            resto = resto[-session.max_history_messages:]
-        return [system_msg] + resto
+    else:
+        system_msg, resto = None, session.messages
 
-    if len(session.messages) > session.max_history_messages:
-        return session.messages[-session.max_history_messages:]
-    return list(session.messages)
+    inicios = _indices_inicio_de_turno(resto)
+    if len(inicios) > session.max_history_turns:
+        corte = inicios[-session.max_history_turns]
+        resto = resto[corte:]
+
+    return ([system_msg] if system_msg else []) + resto
+
+
+def compact_completed_turn(session: SessionMemory) -> None:
+    """
+    Compacta el ÚLTIMO turno del historial una vez que ya terminó (el
+    LLM ya dio su respuesta final en texto, sea con o sin tools de por
+    medio). Reemplaza:
+
+        [user, assistant+tool_calls, tool, tool, ..., assistant(texto)]
+
+    por:
+
+        [user, assistant(texto)]
+
+    -- el mismo contenido conversacional que ve el usuario, sin el JSON
+    crudo de los resultados de tools intermedios, que ya cumplió su
+    función (que el LLM redactara la respuesta) y no aporta nada a
+    turnos futuros. Si el turno no usó ninguna tool (fue directo
+    user -> assistant), no hay nada que compactar y la función no
+    cambia nada.
+
+    Llamar SIEMPRE al final de agent.send_message(), justo antes de
+    devolver la respuesta al usuario -- nunca a mitad de un loop de
+    tool calling todavía en curso (ahí el JSON intermedio todavía hace
+    falta para que el LLM vea el resultado de la tool que acaba de pedir).
+
+    No toca session.actions_log -- el log de auditoría/undo sigue
+    completo siempre; esto solo afecta lo que se le vuelve a mandar al
+    LLM en session.messages.
+    """
+    inicios = _indices_inicio_de_turno(session.messages)
+    if not inicios:
+        return
+
+    inicio_ultimo_turno = inicios[-1]
+    turno = session.messages[inicio_ultimo_turno:]
+
+    # Turno sin tool calling (2 mensajes: user + assistant texto) -> nada que compactar.
+    if len(turno) <= 2:
+        return
+
+    mensaje_usuario = turno[0]
+    mensaje_final = turno[-1]
+
+    # Salvaguarda: si por algún motivo el último mensaje del turno no es
+    # la respuesta final del assistant (ej. el turno se cortó por
+    # _MAX_TOOL_ITERATIONS sin resolver), no tocar nada -- mejor pagar
+    # tokens de más que perder contexto de un turno inconcluso.
+    if mensaje_final.get("role") != "assistant" or mensaje_final.get("tool_calls"):
+        return
+
+    session.messages[inicio_ultimo_turno:] = [mensaje_usuario, mensaje_final]
 
 
 def record_action(
@@ -213,7 +315,7 @@ def get_actions_summary(session: SessionMemory) -> list[str]:
 
 if __name__ == "__main__":
     # Ejemplo rápido para probar el módulo de forma aislada, simulando
-    # una sesión completa: crear, chatear, aplicar tools, deshacer.
+    # una sesión completa con tool calling + compactación.
     df_ejemplo = pd.DataFrame({
         "id": [1, 2, 3],
         "edad": [22, None, 47],
@@ -221,33 +323,26 @@ if __name__ == "__main__":
 
     sesion = create_session(df_ejemplo, system_prompt="Sos un agente de calidad de datos.")
     add_message(sesion, role="user", content="Rellename los nulos de edad con la media")
-
-    print("--- mensajes para el LLM ---")
-    print(get_llm_messages(sesion))
-
-    print("\n--- rate limiter propio de esta sesión ---")
-    print("Presupuesto total combinado:", sesion.rate_limiter.presupuesto_total_combinado(), "tokens/min")
-
-    # Simulamos que el LLM decidió llamar a tratar_valores_faltantes
-    df_nuevo = df_ejemplo.copy()
-    df_nuevo["edad"] = df_nuevo["edad"].fillna(df_nuevo["edad"].mean())
-    record_action(
-        sesion,
-        tool_name="tratar_valores_faltantes",
-        arguments={"strategy": "mean", "columns": ["edad"]},
-        result_summary={"values_filled": {"edad": 1}},
-        new_df=df_nuevo,
+    add_message(
+        sesion, role="assistant", content=None,
+        tool_calls=[{"id": "call_1", "type": "function",
+                     "function": {"name": "tratar_valores_faltantes", "arguments": "{}"}}],
     )
+    add_message(
+        sesion, role="tool", content='{"values_filled": {"edad": 1}, "fill_values": {"edad": 34.5}}',
+        tool_call_id="call_1", name="tratar_valores_faltantes",
+    )
+    add_message(sesion, role="assistant", content="Listo, rellené el nulo de edad con el promedio (34.5).")
 
-    print("\n--- dataset actual (después de la acción) ---")
-    print(sesion.current_df)
+    print("--- historial ANTES de compactar ---")
+    for m in sesion.messages:
+        print(" ", m)
 
-    print("\n--- resumen de acciones ---")
-    for linea in get_actions_summary(sesion):
-        print(" ", linea)
+    compact_completed_turn(sesion)
 
-    print("\n--- undo_last_action() ---")
-    deshecho = undo_last_action(sesion)
-    print("¿Se pudo deshacer?", deshecho)
-    print(sesion.current_df)
-    print("Acciones restantes:", len(sesion.actions_log))
+    print("\n--- historial DESPUÉS de compactar (mismo contexto, menos tokens) ---")
+    for m in sesion.messages:
+        print(" ", m)
+
+    print("\n--- mensajes que se le mandan al LLM ---")
+    print(get_llm_messages(sesion))

@@ -1,65 +1,90 @@
 """
 app.py
-
 Interfaz de Streamlit de DataQualityAgent.
-
-Orquestador delgado: delega toda la lógica de cada sección a los
-módulos de ui/ (state, diagnostico_tab, chat_tab, herramientas_tab,
-diccionario_tab).
-
-Cuatro secciones:
-  1. Diagnóstico — al subir el archivo, corre automáticamente y muestra
-     qué hace falta limpiar (y qué NO), con un score de calidad.
-  2. Chat — lenguaje natural, el agente decide qué tool(s) usar.
-  3. Herramientas manuales — un input dedicado para cada una de las 15
-     tools, para control preciso sin depender del LLM.
-  4. Diccionario de datos — subir un documento (PDF/Word/Excel/CSV) que
-     describa las columnas, para que el chat lo use como contexto (RAG).
-
-Corré con: streamlit run app.py
 """
-
 import streamlit as st
+from pathlib import Path
 
 from config import APP_TITLE, APP_ICON, APP_LAYOUT, DATA_FILE_TYPES
 from ui.state import StateManager
-from ui import diagnostico_tab, chat_tab, herramientas_tab, diccionario_tab
+from ui import diagnostico_tab, chat_tab, herramientas_tab, diccionario_tab, analisis_tab
 
-# ── Page config ──────────────────────────────────────────────
-st.set_page_config(page_title=APP_TITLE, page_icon=APP_ICON, layout=APP_LAYOUT)
+# ── Funciones de Utilidad y Componentes (Views) ──────────────
 
-# ── State manager ────────────────────────────────────────────
-manager = StateManager()
-manager.ensure_initialized()
+def load_css(file_path: str):
+    """Carga y aplica un archivo CSS externo usando pathlib."""
+    path = Path(file_path)
+    if path.is_file():
+        st.markdown(f"<style>{path.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
+    else:
+        st.warning(f"No se encontró el archivo de estilos: {file_path}")
 
-# ── Header ───────────────────────────────────────────────────
-st.title(f"{APP_ICON} {APP_TITLE}")
-st.caption("Subí un Excel o CSV y dejá que el agente te diga qué falta limpiar — o hacelo vos mismo, a mano.")
+def render_header():
+    """Renderiza el título y la tarjeta descriptiva de la aplicación."""
+    st.title(f"{APP_ICON} {APP_TITLE}")
+    st.markdown(
+        """
+        <div class="hero-card">
+            <strong>Agente de data wrangling</strong> para limpiar y transformar tus datos
+            de dos formas: por <strong>chat</strong> (lenguaje natural) o de forma
+            <strong>manual</strong> con herramientas precisas.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-# ── File upload ──────────────────────────────────────────────
-archivo = st.file_uploader("📂 Subí tu archivo de datos", type=DATA_FILE_TYPES)
-manager.handle_file_upload(archivo)
+# ── Función Principal (Controller) ───────────────────────────
 
-if not manager.has_session():
-    st.info("👆 Subí un archivo para empezar.")
-    st.stop()
+def main():
+    # 1. Configuración inicial de la página
+    st.set_page_config(page_title=APP_TITLE, page_icon=APP_ICON, layout=APP_LAYOUT)
+    
+    # 2. Carga de estilos (Separación de UI y Lógica)
+    load_css("assets/style.css") # Ajusta la ruta según tu estructura de carpetas
+    
+    # 3. Renderizar Header
+    render_header()
 
-# ── Sidebar ──────────────────────────────────────────────────
-manager.render_sidebar()
+    # 4. Inicializar Estado (Model/State)
+    manager = StateManager()
+    manager.ensure_initialized()
 
-# ── Tabs ─────────────────────────────────────────────────────
-tab_diagnostico, tab_chat, tab_herramientas, tab_diccionario = st.tabs(
-    ["📋 Diagnóstico", "💬 Chat", "🔧 Herramientas manuales", "📖 Diccionario de datos"]
-)
+    # 5. Interfaz de carga de archivos
+    archivo = st.file_uploader("📂 Subí tu archivo de datos", type=DATA_FILE_TYPES)
+    manager.handle_file_upload(archivo)
 
-with tab_diagnostico:
-    diagnostico_tab.render(manager)
+    # 6. Barrera de validación (Early Return)
+    if not manager.has_session():
+        st.info(
+            "👆 Subí un Excel o CSV para empezar.\n\n"
+            "Luego podrás diagnosticar la calidad de los datos, limpiarlos por chat "
+            "o usar las herramientas manuales."
+        )
+        return  # Reemplaza st.stop() por return dentro de una función
 
-with tab_chat:
-    chat_tab.render(manager)
+    # 7. Renderizar Sidebar y Tabs
+    manager.render_sidebar()
 
-with tab_herramientas:
-    herramientas_tab.render(manager)
+    tab_diagnostico, tab_chat, tab_analisis, tab_herramientas, tab_diccionario = st.tabs(
+        ["📋 Diagnóstico", "💬 Chat", "🧮 Análisis libre", "🔧 Herramientas", "📖 Diccionario"]
+    )
 
-with tab_diccionario:
-    diccionario_tab.render(manager)
+    with tab_diagnostico:
+        diagnostico_tab.render(manager)
+
+    with tab_chat:
+        chat_tab.render(manager)
+
+    with tab_analisis:
+        analisis_tab.render(manager)
+
+    with tab_herramientas:
+        herramientas_tab.render(manager)
+
+    with tab_diccionario:
+        diccionario_tab.render(manager)
+
+
+# ── Punto de Entrada ─────────────────────────────────────────
+if __name__ == "__main__":
+    main()

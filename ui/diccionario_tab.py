@@ -19,10 +19,13 @@ from ui.state import StateManager
 
 def render(manager: StateManager) -> None:
     """Renderiza la pestaña de Diccionario de datos."""
-    st.caption(
-        "Subí un documento que explique qué significa cada columna de tu dataset "
-        "(PDF, Word, Excel o CSV) — el chat lo va a usar como contexto adicional."
-    )
+    st.markdown(
+    '<p style="color: #2F243D; font-weight: 500; font-size: 1rem;">'
+    'Subí un documento que explique qué significa cada columna de tu dataset (PDF, Word, Excel o CSV) — '
+    'el chat lo va a usar como contexto adicional.'
+    '</p>', 
+    unsafe_allow_html=True
+)
 
     dic_file = st.file_uploader(
         "📖 Diccionario de datos",

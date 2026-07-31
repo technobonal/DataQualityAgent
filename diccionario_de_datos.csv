@@ -1,0 +1,8 @@
+columna,descripcion,tipo,valores_validos
+id,Identificador único del cliente,numerico,entero positivo único
+edad,Edad del cliente en años,numerico,0 a 120
+estado,Estado actual de la cuenta,categorico,"activo, inactivo, pendiente"
+ciudad,Ciudad de residencia del cliente,texto,texto libre
+monto,Monto total de compras del cliente en pesos,numerico,mayor o igual a 0
+fecha_registro,Fecha en la que el cliente se registró,fecha,formato AAAA-MM-DD
+email,Correo electrónico de contacto del cliente,texto,formato de email válido

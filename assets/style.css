@@ -1,0 +1,133 @@
+:root {
+    --lila: #B794D4;
+    --lila-oscuro: #5C3D7A;
+    --lila-fondo: #E6D4F4; /* <-- Nuevo lila intermedio */
+}
+
+/* Forzamos el fondo lila en el contenedor principal (lado derecho) */
+.stApp, 
+[data-testid="stAppViewContainer"] {
+    background-color: var(--lila-fondo) !important;
+}
+
+/* Título principal */
+h1 {
+    color: var(--lila-oscuro) !important;
+    font-weight: 700 !important;
+}
+
+/* Tarjeta de descripción */
+.hero-card {
+    background: #FFFFFF;
+    border: 1px solid #E6D4F2;
+    border-left: 5px solid var(--lila);
+    border-radius: 14px;
+    padding: 1.1rem 1.3rem;
+    margin: 0.3rem 0 1.4rem 0;
+    box-shadow: 0 2px 8px rgba(92, 61, 122, 0.06);
+    color: #3D2F4A !important;
+    font-size: 1.05rem;
+    line-height: 1.55;
+}
+
+.hero-card strong {
+    color: #5C3D7A !important;
+}
+
+/* Uploader */
+.stFileUploader {
+    background: #FFFFFF;
+    border: 1px dashed #D4B8E8;
+    border-radius: 12px;
+    padding: 0.75rem;
+}
+
+/* Botones */
+.stButton > button {
+    background: var(--lila) !important;
+    color: white !important;
+    border-radius: 10px !important;
+    border: none !important;
+    font-weight: 600 !important;
+}
+.stButton > button:hover {
+    background: var(--lila-oscuro) !important;
+    color: white !important;
+}
+
+/* Tab activa */
+button[data-baseweb="tab"][aria-selected="true"] {
+    color: var(--lila-oscuro) !important;
+    border-bottom: 3px solid var(--lila) !important;
+}
+
+/* Mejor contraste en Diagnóstico */
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li,
+[data-testid="stMarkdownContainer"] span {
+    color: #2F243D !important;
+    font-weight: 500;
+}
+
+/* Score y títulos de sección más oscuros */
+[data-testid="stMarkdownContainer"] h1,
+[data-testid="stMarkdownContainer"] h2,
+[data-testid="stMarkdownContainer"] h3,
+[data-testid="stMarkdownContainer"] strong {
+    color: #3D2A55 !important;
+}
+
+/* Si las cajas azules vienen con HTML inline, forzamos texto oscuro */
+div[style*="background"] {
+    color: #2F243D !important;
+}
+
+/* ---assets/style.css --- */
+
+/* --- PARCHE DE CORRECCIONES DE CONTRASTE (FONDOS OSCUROS) --- */
+
+/* 1. Títulos en la Sidebar (ej: "Sesión actual") */
+/* Usamos un lila mucho más claro para que resalte */
+[data-testid="stSidebar"] h1, 
+[data-testid="stSidebar"] h2, 
+[data-testid="stSidebar"] h3 {
+    color: #D4BEE8 !important; /* Lila muy claro y legible */
+}
+
+/* 2. Texto General en la Sidebar (ej: Recuento de filas/columnas) */
+/* Añadimos strong, span y b para atrapar cualquier formato extra */
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] span,
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] strong,
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] b {
+    color: #FFFFFF !important; /* Blanco puro */
+    font-weight: 500;
+}
+
+/* 3. Iconos en la Sidebar (ej: la nube) */
+/* Forzamos que los iconos también sean blancos */
+[data-testid="stSidebar"] svg {
+    fill: #FFFFFF !important;
+}
+
+/* 4. Cabeceras de Tabla (ej: "Region", "State") */
+/* Hacemos que el texto de las cabeceras sea blanco */
+thead th {
+    color: #FFFFFF !important; /* Blanco puro */
+}
+
+/* 5. Texto del Botón de Descarga */
+/* Target específico para el texto dentro del botón de descarga */
+.stDownloadButton > button p {
+    color: #DDC8F0 !important; /* Lila suave y legible */
+}
+/* --- Nota aclaratoria fija al pie del chat --- */
+.chat-disclaimer {
+    text-align: center;
+    font-size: 0.82rem;
+    color: #6A557A !important; /* Lila oscuro discreto para buena lectura */
+    margin-top: 8px;
+    margin-bottom: 12px;
+    font-weight: 400;
+    opacity: 0.85;
+}

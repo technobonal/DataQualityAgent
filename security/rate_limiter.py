@@ -11,10 +11,9 @@ REDISEÑO (v2 -- agrega tracking de RPM): cada modelo de GROQ_MODEL_CHAIN
 tiene su PROPIA cuota de tokens/minuto Y de requests/minuto en Groq (no
 un pool único compartido):
 
-    llama-3.3-70b-versatile   -> 12.000 TPM / 30 RPM
-    openai/gpt-oss-20b        ->  8.000 TPM / 30 RPM
-    openai/gpt-oss-120b       ->  8.000 TPM / 30 RPM
-    llama-3.1-8b-instant      ->  6.000 TPM / 30 RPM
+    openai/gpt-oss-120b       ->  8.000 TPM / 30 RPM  (reemplazo oficial de llama-3.3-70b-versatile)
+    openai/gpt-oss-20b        ->  8.000 TPM / 30 RPM  (reemplazo oficial de llama-3.1-8b-instant)
+    qwen/qwen3.6-27b          ->  8.000 TPM / 30 RPM  (PREVIEW — Groq avisa que puede discontinuarse sin aviso)
 
 MOTIVO DEL AGREGADO DE RPM: la v1 de este archivo solo trackeaba TPM.
 En la práctica, con varias tool-calls seguidas en poco tiempo (loop de
@@ -51,10 +50,9 @@ except ImportError:
 # core/llm_client.py (GROQ_MODEL_CHAIN). Si tu cuenta de Groq cambia de
 # plan y estos números cambian, actualizar acá.
 MODEL_TPM_LIMITS: dict[str, int] = {
-    "llama-3.3-70b-versatile": 12000,
-    "openai/gpt-oss-20b": 8000,
     "openai/gpt-oss-120b": 8000,
-    "llama-3.1-8b-instant": 6000,
+    "openai/gpt-oss-20b": 8000,
+    "qwen/qwen3.6-27b": 8000,  # PREVIEW en Groq: puede discontinuarse sin aviso
 }
 _FALLBACK_TPM_LIMIT = 6000  # para un modelo que no esté en el dict de arriba
 
@@ -62,10 +60,9 @@ _FALLBACK_TPM_LIMIT = 6000  # para un modelo que no esté en el dict de arriba
 # para casi todos los modelos). Este es el eje que faltaba trackear --
 # ver la nota de "MOTIVO DEL AGREGADO" más arriba.
 MODEL_RPM_LIMITS: dict[str, int] = {
-    "llama-3.3-70b-versatile": 30,
-    "openai/gpt-oss-20b": 30,
     "openai/gpt-oss-120b": 30,
-    "llama-3.1-8b-instant": 30,
+    "openai/gpt-oss-20b": 30,
+    "qwen/qwen3.6-27b": 30,
 }
 _FALLBACK_RPM_LIMIT = 30  # para un modelo que no esté en el dict de arriba
 
@@ -178,6 +175,30 @@ class RateLimiter:
                 window_seconds=self.window_seconds,
             )
         return self._ventanas[model]
+
+    def cabe_en_limite_absoluto(self, model: str, tokens_estimados: int) -> bool:
+        """
+        ¿Es siquiera POSIBLE que este modelo procese un pedido de este
+        tamaño, sin importar cuánto cupo tenga libre en este momento?
+        Groq rechaza un request que por sí solo supera el límite de TPM
+        del modelo -- eso no se arregla esperando, ni tiene sentido
+        reintentar. Se usa para filtrar candidatos de fallback ANTES de
+        gastar un intento real contra la API (ver chat_completion en
+        core/llm_client.py).
+        """
+        return tokens_estimados <= self._ventana(model).presupuesto_efectivo
+
+    def filtrar_modelos_viables(self, cadena: list[str], tokens_estimados: int) -> list[str]:
+        """
+        Filtra `cadena` dejando solo los modelos donde este pedido
+        PODRÍA entrar (según su límite absoluto de TPM) -- no chequea
+        cupo actual, eso ya lo hace puede_proceder()/
+        siguiente_modelo_disponible(). Pensado para construir la lista
+        de fallback dentro de un mismo turno: no tiene sentido
+        reintentar con un modelo cuyo techo es menor al tamaño del
+        pedido, aunque tenga cupo libre en este instante.
+        """
+        return [m for m in cadena if self.cabe_en_limite_absoluto(m, tokens_estimados)]
 
     def presupuesto_efectivo(self, model: str) -> int:
         """Tokens/min disponibles para ESE modelo puntual, tras el margen de seguridad."""

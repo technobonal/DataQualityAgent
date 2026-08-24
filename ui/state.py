@@ -26,6 +26,15 @@ _KEY_IS_PROCESSING = "is_processing"
 _KEY_CHAT_TABLES = "chat_tables"
 _KEY_CHAT_FALLBACK_MSGS = "chat_fallback_msgs"
 
+# NOTA: estas dos keys pertenecen conceptualmente a ui/analisis_tab.py
+# (_KEY_HISTORIAL y _KEY_CORRECCION_PENDIENTE ahí) -- se duplican los
+# strings literales acá, en vez de importarlas, para evitar un import
+# circular (ui/analisis_tab.py ya importa StateManager desde este
+# archivo). Si cambiás el nombre de esas keys en analisis_tab.py,
+# actualizá también estas dos constantes.
+_KEY_ANALISIS_HISTORIAL = "analisis_libre_historial"
+_KEY_ANALISIS_CORRECCION_PENDIENTE = "analisis_libre_correccion_pendiente"
+
 
 class StateManager:
     """Wrapper controlado sobre st.session_state."""
@@ -120,10 +129,25 @@ class StateManager:
 
     # --- Reset ---
     def reset(self) -> None:
-        """Borra toda la sesión para empezar de cero."""
+        """
+        Borra toda la sesión para empezar de cero.
+
+        FIX: antes solo limpiaba las keys de esta clase (sesión,
+        diagnóstico, tablas del chat) -- pero el historial de la tab de
+        Análisis libre (ui/analisis_tab.py) vive en su PROPIA key de
+        session_state, separada a propósito (ver docstring de ese
+        archivo). Sin esto, al resetear y subir un dataset DISTINTO, las
+        preguntas/respuestas del dataset anterior seguían ahí -- y con
+        el mecanismo de contexto_previo (analysis/pandasai_wrapper.py),
+        ese historial viejo se le pasaría como contexto al LLM para
+        preguntas sobre el dataset NUEVO, confundiéndolo en vez de
+        ayudar.
+        """
         st.session_state[_KEY_SESSION] = None
         st.session_state[_KEY_DIAGNOSTICO] = None
         st.session_state[_KEY_IS_PROCESSING] = False
         st.session_state[_KEY_CHAT_TABLES] = {}
         st.session_state[_KEY_CHAT_FALLBACK_MSGS] = {}
+        st.session_state[_KEY_ANALISIS_HISTORIAL] = []
+        st.session_state.pop(_KEY_ANALISIS_CORRECCION_PENDIENTE, None)
         st.rerun()

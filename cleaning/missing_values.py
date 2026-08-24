@@ -258,3 +258,5 @@ if __name__ == "__main__":
     print("\n--- handle_missing_values(strategy='mean') sigue igual ---")
     df_res, resumen = handle_missing_values(df_ejemplo, strategy="mean", columns=["edad"])
     print(resumen.to_dict())
+
+    

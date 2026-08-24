@@ -51,7 +51,7 @@ OLLAMA_CLOUD_BASE = os.getenv("OLLAMA_CLOUD_BASE", "https://ollama.com/v1")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-_DEFAULT_GROQ_CHAIN = "llama-3.3-70b-versatile,openai/gpt-oss-20b,openai/gpt-oss-120b,llama-3.1-8b-instant"
+_DEFAULT_GROQ_CHAIN = "openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.6-27b"
 GROQ_MODEL_CHAIN = [
     m.strip() for m in os.getenv("GROQ_MODEL_CHAIN", _DEFAULT_GROQ_CHAIN).split(",") if m.strip()
 ]
@@ -170,9 +170,10 @@ def chat_completion(
          Ollama Cloud (evita mandarle a Groq una llamada que ya
          sabemos que va a rechazar).
       3. Si hay un modelo con cupo, arranca la cadena por ESE modelo
-         (reordenada), y sigue con el resto como respaldo si falla por
-         otro motivo (no por cuota). Cada llamada exitosa registra su
-         gasto real en rate_limiter.
+         (reordenada, y filtrada a los que el pedido puede entrar por
+         su límite absoluto), y sigue con el resto como respaldo si
+         falla por otro motivo (no por cuota). Cada llamada exitosa
+         registra su gasto real en rate_limiter.
       4. Si toda la cadena de Groq falla igual (por error, no por
          cuota agotada), se intenta Ollama Cloud.
       5. Si Ollama Cloud también falla (o no tiene API key
@@ -217,8 +218,17 @@ def chat_completion(
         orden = []
     else:
         # Reordena la cadena para arrancar por el modelo con cupo disponible;
-        # el resto queda como respaldo si ese falla por otro motivo (no por cuota).
-        orden = [modelo_sugerido] + [m for m in GROQ_MODEL_CHAIN if m != modelo_sugerido]
+        # el resto queda como respaldo SOLO si el pedido entra en su límite
+        # absoluto -- sin esto, se intentaba con modelos que iban a
+        # rechazar el pedido por tamaño sin importar el cupo (ver
+        # rate_limiter.cabe_en_limite_absoluto).
+        candidatos = [modelo_sugerido] + [m for m in GROQ_MODEL_CHAIN if m != modelo_sugerido]
+        orden = rate_limiter.filtrar_modelos_viables(candidatos, tokens_estimados)
+        if not orden:
+            logger.info(
+                f"[chat_completion] El pedido ({tokens_estimados} tokens) supera el límite "
+                "absoluto de TODOS los modelos de Groq -> probando Ollama Cloud directo."
+            )
 
     # --- INICIO DEL BUCLE GROQ MODIFICADO ---
     for modelo in orden:
@@ -228,7 +238,7 @@ def chat_completion(
             rate_limiter.registrar_uso(modelo, tokens_estimados)
             logger.info(f"[chat_completion] Respondió groq/{modelo}")
             return respuesta
-            
+
         except litellm.BadRequestError as e:
             if "tool_use_failed" in str(e):
                 try:
@@ -242,17 +252,17 @@ def chat_completion(
                     # NUEVO LOG: Muestra por qué falló el reintento
                     logger.warning(f"[chat_completion] Reintento fallido con groq/{modelo}: {str(e2)}")
                     continue
-                    
+
             error_groq = e
             # NUEVO LOG: Muestra por qué falló con BadRequest
             logger.warning(f"[chat_completion] Falló groq/{modelo} (BadRequest): {str(e)}")
             continue
-            
+
         except Exception as e:
             error_groq = e
             # NUEVO LOG: Muestra cualquier otro error general
             logger.warning(f"[chat_completion] Falló groq/{modelo}: {str(e)}")
-            continue  
+            continue
     # --- FIN DEL BUCLE GROQ MODIFICADO ---
 
     if orden:
@@ -295,6 +305,7 @@ def chat_completion(
             f"Error de Ollama Cloud: {error_cloud}. "
             f"Error de Ollama local: {e_ollama}"
         ) from e_ollama
+
 
 def extract_tool_calls(response: Any) -> list[dict[str, Any]]:
     """

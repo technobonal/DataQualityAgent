@@ -1,17 +1,17 @@
-# DataQualityAgent
+DataQualityAgent
 
-## 📋 Descripción General
+📋 Descripción General
 
-**DataQualityAgent** es una aplicación construida en Streamlit que automatiza la limpieza, el control de calidad y el análisis exploratorio de datasets, combinando un motor determinístico basado en pandas con capacidades de lenguaje natural impulsadas por LLM.
+DataQualityAgent es una aplicación construida en Streamlit que automatiza la limpieza, el control de calidad y el análisis exploratorio de datasets, combinando un motor determinístico basado en pandas con capacidades de lenguaje natural impulsadas por LLM.
 
 El sistema permite a un usuario cargar un archivo de datos y, mediante una interfaz conversacional o herramientas guiadas, ejecutar tareas como:
 
-- Diagnóstico de calidad de datos (nulos, duplicados, tipos, outliers).
-- Limpieza y estandarización de columnas (normalización, binning, formateo).
-- Corrección de datos y eliminación de filas mediante instrucciones en lenguaje natural.
-- Trazabilidad completa de cada transformación aplicada sobre el dataset.
+Diagnóstico de calidad de datos (nulos, duplicados, tipos, outliers).
+Limpieza y estandarización de columnas (normalización, binning, formateo).
+Corrección de datos y eliminación de filas mediante instrucciones en lenguaje natural.
+Trazabilidad completa de cada transformación aplicada sobre el dataset.
 
-El diseño prioriza la seguridad: el modelo de lenguaje **nunca ejecuta código arbitrario** directamente. Toda acción pasa por un despachador de herramientas (*tool dispatcher*) que solo puede invocar funciones predefinidas y auditadas, o bien por un entorno aislado (*sandbox*) cuando se requiere generación dinámica de código.
+El agente implementa el patrón de tool calling / function calling: en lugar de generar y ejecutar código libremente, el modelo de lenguaje interpreta la intención del usuario y selecciona qué función invocar de un conjunto de 15 herramientas predefinidas (definidas con un schema estilo OpenAI, compatible con Groq vía LiteLLM). El LLM decide qué herramienta usar y con qué argumentos, pero nunca ejecuta código arbitrario directamente — toda invocación pasa por un despachador de herramientas (dispatch_tool) que valida y ejecuta únicamente funciones ya escritas y auditadas. Para los casos que requieren generación dinámica de código (por ejemplo, correcciones ambiguas en lenguaje natural), esa generación queda aislada dentro de un entorno controlado (sandbox), nunca en el flujo principal del agente.
 
 ---
 
@@ -69,19 +69,17 @@ Esto garantiza trazabilidad total: en cualquier momento se puede saber qué se c
 
 ---
 
-## 🛠️ Tecnologías y Herramientas Utilizadas
-
-| Categoría | Tecnología |
-|---|---|
-| Interfaz de usuario | Streamlit |
-| Procesamiento de datos | pandas |
-| Orquestación LLM | LiteLLM (compatible con Groq) |
-| Generación de código dinámico | PandasAI |
-| Definición de herramientas | Schema estilo OpenAI (tool calling) |
-| Recuperación aumentada (RAG) | Vectorstore propio + validadores |
-| Testing | `streamlit.testing.v1.AppTest` |
-| Lenguaje | Python |
-
+🛠️ Tecnologías y Herramientas Utilizadas
+Categoría	Tecnología
+Interfaz de usuario	Streamlit
+Procesamiento de datos	pandas
+Orquestación LLM	LiteLLM (compatible con Groq)
+Patrón de agente	Tool Calling / Function Calling
+Generación de código dinámico	PandasAI
+Definición de herramientas	Schema estilo OpenAI (tool calling)
+Recuperación aumentada (RAG)	Vectorstore propio + validadores
+Testing	streamlit.testing.v1.AppTest
+Lenguaje	Python
 ---
 
 ## 🚀 Instrucciones para Ejecutar el Proyecto

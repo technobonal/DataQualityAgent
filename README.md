@@ -169,7 +169,8 @@ Se encontraron 7 filas completamente duplicadas en el dataset.
 
 ## 🖼️ Capturas del Proyecto en Curso
 
-*(Espacio reservado para agregar imágenes/screenshots del proyecto)*
+*(E<img width="875" height="981" alt="image9" src="https://github.com/user-attachments/assets/38cdfeeb-65f6-4548-be21-ea899cdce19a" />
+spacio reservado para agregar imágenes/screenshots del proyecto)*
 
 <!--
 ![Diagnóstico inicial](ruta/a/imagen1.png)

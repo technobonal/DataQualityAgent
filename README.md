@@ -172,6 +172,11 @@ Se encontraron 7 filas completamente duplicadas en el dataset.
 *(E<img width="875" height="981" alt="image9" src="https://github.com/user-attachments/assets/38cdfeeb-65f6-4548-be21-ea899cdce19a" />
 spacio reservado para agregar imágenes/screenshots del proyecto)*
 
+<img width="908" height="1049" alt="image11" src="https://github.com/user-attachments/assets/d223bcd2-55e2-4e9b-ade7-00c7eb7c85ee" />
+
+<img width="907" height="847" alt="image15" src="https://github.com/user-attachments/assets/2434f3d2-e18f-4214-aa91-19609f6cc8c6" />
+<img width="960" height="1175" alt="image14" src="https://github.com/user-attachments/assets/b40dfc6d-969b-47c5-a3ea-4b4eff26f2cd" />
+
 <!--
 ![Diagnóstico inicial](ruta/a/imagen1.png)
 ![Tab de análisis](ruta/a/imagen2.png)

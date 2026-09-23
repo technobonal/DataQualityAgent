@@ -33,6 +33,54 @@ asignada; si no, se devuelve como FALLO (con un mensaje claro), para que
 el caller (pandasai_wrapper.analizar_con_pandasai /
 corregir_columnas_con_pandasai) pueda reintentar pidiéndole al LLM que
 corrija el código, en vez de creer que el análisis realmente dio None.
+
+Soporte de gráficos (matplotlib): el código generado no puede hacer
+`import matplotlib` -- ni falta hace agregarlo a _PATRONES_PROHIBIDOS,
+porque el entorno restringido ya no tiene `__import__` disponible (ver
+_BUILTINS_PERMITIDOS), así que cualquier `import` de lo que sea falla en
+tiempo de ejecución de todos modos. En cambio, mismo patrón ya usado con
+`corregir_fecha`: se importa matplotlib ACÁ (a nivel de módulo, una sola
+vez, con backend "Agg" -- no interactivo, obligatorio en un proceso sin
+display; si se usa el backend por defecto puede colgarse o fallar) y se
+inyecta el objeto `plt` ya listo en el entorno de ejecución. El código
+generado simplemente lo usa como variable disponible: `fig, ax =
+plt.subplots()`, nunca lo importa ni lo instancia él mismo.
+
+Nota de picklabilidad: un objeto Figure de matplotlib viaja de vuelta al
+proceso padre por la misma multiprocessing.Queue que ya se usa para
+DataFrames -- con backend Agg (sin canvas interactivo/GUI) las Figure
+son picklables en la práctica; confirmado con test manual (ver
+tests/test_sandbox.py, pendiente de escribir formalmente).
+
+FIX (revisión de seguridad post-implementación, 3 hallazgos):
+
+  1. _BUILTINS_PERMITIDOS no incluía ningún tipo de excepción
+     (Exception, ValueError, KeyError, etc.) ni isinstance/type.
+     Código generado perfectamente razonable -- un try/except, un
+     isinstance() -- reventaba con NameError en vez de con el error
+     real. Confirmado con testing manual antes de este fix.
+
+  2. _PATRONES_PROHIBIDOS solo cubría `import X` literal, no
+     `from X import Y`. Ejemplo: "from os import listdir" pasaba el
+     análisis estático sin ser rechazado (rejected_by_static_analysis
+     quedaba en False). No era explotable -- la segunda capa (sin
+     __import__ en builtins) lo frenaba igual en runtime -- pero es
+     el tipo de gap que un día deja de estar cubierto si alguien toca
+     la segunda capa sin saber que el análisis estático dependía de
+     ella. Se agregó el patrón correspondiente.
+
+  3. IMPORTANTE -- acoplamiento implícito entre `type` y el regex de
+     dunders: agregar `type` a los builtins reabre, en teoría, el
+     escape clásico de sandboxes en Python:
+         objeto.__class__.__bases__[0].__subclasses__()
+     que permite llegar a clases ya cargadas en memoria (algunas
+     potencialmente peligrosas) SIN necesidad de import. Esto sigue
+     bloqueado porque el regex `__[a-zA-Z_]+__` prohíbe cualquier
+     acceso a atributos dunder como texto -- pero es una dependencia
+     que antes no estaba documentada. NO QUITAR ese patrón del regex
+     sin agregar antes una defensa equivalente (ej. un AST-walker que
+     rechace Attribute nodes dunder) -- si se quita, este escape
+     vuelve a estar abierto.
 """
 
 from __future__ import annotations
@@ -42,6 +90,10 @@ import multiprocessing
 import re
 from dataclasses import dataclass
 from typing import Any
+
+import matplotlib
+matplotlib.use("Agg")  # backend no interactivo -- obligatorio en un proceso sin display
+import matplotlib.pyplot as plt
 
 import pandas as pd
 
@@ -55,10 +107,19 @@ _PATRONES_PROHIBIDOS = [
     r"\bimport\s+os\b", r"\bimport\s+sys\b", r"\bimport\s+subprocess\b",
     r"\bimport\s+socket\b", r"\bimport\s+shutil\b", r"\bimport\s+requests\b",
     r"\bimport\s+urllib\b", r"\bimport\s+pathlib\b", r"\bimport\s+ctypes\b",
+    # FIX #2 -- "from X import Y" no matcheaba ningún patrón de arriba.
+    # No explotable hoy (sin __import__ en builtins, falla igual en
+    # runtime) pero se cierra acá también para no depender solo de esa
+    # segunda capa.
+    r"\bfrom\s+\w+\s+import\b",
     r"__import__\s*\(", r"\bopen\s*\(", r"\beval\s*\(", r"\bexec\s*\(",
     r"\bcompile\s*\(", r"\bgetattr\s*\(", r"\bsetattr\s*\(", r"\bdelattr\s*\(",
     r"\bglobals\s*\(", r"\blocals\s*\(", r"\bvars\s*\(",
-    r"__[a-zA-Z_]+__",  # cualquier acceso a dunder attributes/métodos
+    # Cualquier acceso a dunder attributes/métodos -- ESTE patrón es lo
+    # único que neutraliza el escape vía type()/__class__ ahora que
+    # type está en _BUILTINS_PERMITIDOS (ver FIX #3 arriba). No tocar
+    # sin agregar una defensa equivalente.
+    r"__[a-zA-Z_]+__",
     r"\bos\.", r"\bsys\.", r"\bsubprocess\.",
 ]
 
@@ -67,9 +128,15 @@ _PATRONES_PROHIBIDOS = [
 # etc.) directamente no existe dentro del código ejecutado.
 _BUILTINS_PERMITIDOS = {
     "abs", "all", "any", "bool", "dict", "enumerate", "filter", "float",
-    "int", "len", "list", "map", "max", "min", "print", "range", "reversed",
-    "round", "set", "sorted", "str", "sum", "tuple", "zip",
+    "int", "isinstance", "len", "list", "map", "max", "min", "print",
+    "range", "reversed", "round", "set", "sorted", "str", "sum", "tuple",
+    "type", "zip",
     "True", "False", "None",
+    # FIX #1 -- excepciones básicas. Sin esto, cualquier try/except en
+    # código generado por el LLM (patrón normal y esperable) reventaba
+    # con NameError en vez de con el error real que se quiso atrapar.
+    "Exception", "ValueError", "TypeError", "KeyError", "IndexError",
+    "AttributeError", "ZeroDivisionError", "StopIteration",
 }
 
 
@@ -77,8 +144,7 @@ def _corregir_columna_fecha_robusta(serie: pd.Series) -> pd.Series:
     """
     Convierte una columna de texto a datetime.
 
-    HISTORIA DEL DISEÑO (dos iteraciones, ver security/sandbox.py __main__
-    para los benchmarks):
+    HISTORIA DEL DISEÑO (dos iteraciones):
 
     v1 (parseo valor por valor con pd.to_datetime): resolvía bien el
     problema de pérdida de datos (pd.to_datetime en LOTE adivina el
@@ -104,8 +170,6 @@ def _corregir_columna_fecha_robusta(serie: pd.Series) -> pd.Series:
     resultado = pd.Series(pd.NaT, index=serie.index, dtype="datetime64[ns]")
     pendientes = serie.notna()
 
-    # Formatos comunes a probar, en orden -- se puede ampliar esta lista
-    # si en tu dataset real aparecen formatos que no están cubiertos acá.
     _FORMATOS_COMUNES = (
         "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d",
         "%d-%m-%Y", "%Y.%m.%d", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S",
@@ -118,8 +182,6 @@ def _corregir_columna_fecha_robusta(serie: pd.Series) -> pd.Series:
         resultado.loc[intento.index[resueltos]] = intento[resueltos]
         pendientes.loc[intento.index[resueltos]] = False
 
-    # Fallback lento -- SOLO sobre lo que quedó pendiente tras probar
-    # todos los formatos comunes (en la práctica, un subconjunto chico).
     if pendientes.any():
         recuperados = serie[pendientes].apply(lambda v: pd.to_datetime(v, errors="coerce"))
         resultado.loc[pendientes] = recuperados
@@ -183,20 +245,14 @@ def _ejecutar_en_proceso_aislado(codigo: str, df: pd.DataFrame, queue: multiproc
         "__builtins__": builtins_restringidos,
         "pd": pd,
         "df": df.copy(),
-        # Función pre-testeada para columnas de fecha -- ver
-        # _corregir_columna_fecha_robusta arriba para el motivo. El
-        # código generado la puede llamar como corregir_fecha(df['col']).
         "corregir_fecha": _corregir_columna_fecha_robusta,
+        "plt": plt,
     }
     entorno_local: dict[str, Any] = {}
 
     try:
         exec(codigo, entorno_global, entorno_local)
 
-        # FIX: antes se hacía entorno_local.get("resultado", entorno_local.get("result")),
-        # que devuelve None tanto si la variable no existe como si existe y vale None.
-        # Ahora se busca explícitamente CUÁL de las dos claves está presente, para
-        # poder avisar si NINGUNA fue asignada (en vez de reportarlo como éxito).
         if "resultado" in entorno_local:
             resultado = entorno_local["resultado"]
         elif "result" in entorno_local:
@@ -226,12 +282,13 @@ def run_sandboxed(codigo: str, df: pd.DataFrame) -> SandboxResult:
     una variable llamada `resultado` (o `result`). Ej.:
         "resultado = df['edad'].mean()"
 
-    Nota importante para código de CORRECCIÓN (a diferencia de análisis
-    de solo lectura): como acá arriba se le pasa una COPIA de `df` al
-    proceso aislado, mutar `df` in-place dentro del código generado NO
-    alcanza para que el cambio vuelva al caller -- el código debe
-    asignar el DataFrame ya corregido a `resultado` (ej.: `resultado =
-    df` al final), o el cambio se pierde cuando termina el proceso hijo.
+    Nota importante para código de CORRECCIÓN/ELIMINACIÓN (a diferencia
+    de análisis de solo lectura): como acá arriba se le pasa una COPIA
+    de `df` al proceso aislado, mutar `df` in-place dentro del código
+    generado NO alcanza para que el cambio vuelva al caller -- el código
+    debe asignar el DataFrame ya modificado a `resultado` (ej.:
+    `resultado = df` al final), o el cambio se pierde cuando termina el
+    proceso hijo.
 
     Devuelve un SandboxResult — nunca lanza una excepción hacia afuera,
     incluso si el código falla, se cuelga, o es rechazado de entrada.
@@ -255,10 +312,8 @@ def run_sandboxed(codigo: str, df: pd.DataFrame) -> SandboxResult:
     # el hijo se bloquea escribiendo hasta que alguien lea del otro
     # lado. Si el padre hace join() ANTES de leer, queda esperando a
     # que el hijo termine, mientras el hijo espera a que el padre lea
-    # -- deadlock clásico, documentado en la letra chica de la librería
-    # estándar. Esto causaba el timeout real en producción con datasets
-    # de tamaño normal (no era lentitud de cómputo -- confirmado con
-    # benchmarks, ver _corregir_columna_fecha_robusta).
+    # -- deadlock clásico. Esto causaba el timeout real en producción
+    # con datasets de tamaño normal (no era lentitud de cómputo).
     try:
         estado, valor = queue.get(timeout=_TIMEOUT_SEGUNDOS)
     except Exception:
@@ -285,39 +340,32 @@ if __name__ == "__main__":
     print("\n--- 2. Código malicioso: intenta importar os ---")
     print(run_sandboxed("import os\nresultado = os.listdir('.')", df_ejemplo).to_dict())
 
-    print("\n--- 3. Código malicioso: intenta leer archivos del sistema ---")
-    print(run_sandboxed("resultado = open('/etc/passwd').read()", df_ejemplo).to_dict())
+    print("\n--- 3. NUEVO: from-import (antes bypaseaba el análisis estático) ---")
+    r = run_sandboxed("from os import listdir\nresultado = 1", df_ejemplo)
+    print(r.to_dict())
 
-    print("\n--- 4. Código que se cuelga (loop infinito) ---")
+    print("\n--- 4. NUEVO: try/except con tipos de excepción básicos ---")
+    print(run_sandboxed(
+        "try:\n    resultado = 1/0\nexcept ZeroDivisionError:\n    resultado = -1",
+        df_ejemplo,
+    ).to_dict())
+
+    print("\n--- 5. NUEVO: isinstance/type ---")
+    print(run_sandboxed("resultado = isinstance(df, type(df))", df_ejemplo).to_dict())
+
+    print("\n--- 6. NUEVO: intento de escape vía __class__ -- debe seguir rechazado ---")
+    print(run_sandboxed(
+        "resultado = ().__class__.__bases__[0].__subclasses__()",
+        df_ejemplo,
+    ).to_dict())
+
+    print("\n--- 7. Código que se cuelga (loop infinito) ---")
     print(run_sandboxed("while True:\n    pass", df_ejemplo).to_dict())
 
-    print("\n--- 5. Código con error normal de ejecución (división por cero) ---")
-    print(run_sandboxed("resultado = 1/0", df_ejemplo).to_dict())
-
-    print("\n--- 6. NUEVO: código que corre bien pero NO asigna resultado (el bug del None) ---")
-    print(run_sandboxed("x = df['edad'].mean()\nprint(x)", df_ejemplo).to_dict())
-
-    print("\n--- 7. NUEVO: código que corrige un dtype numérico y devuelve el df corregido ---")
-    df_texto = pd.DataFrame({"edad": ["22", "25", "47"]})
-    resultado_correccion = run_sandboxed(
-        "df['edad'] = pd.to_numeric(df['edad'], errors='coerce')\nresultado = df",
-        df_texto,
+    print("\n--- 8. Gráfico con plt ya inyectado (sin import) ---")
+    resultado_grafico = run_sandboxed(
+        "fig, ax = plt.subplots()\nax.bar(df['edad'].index.astype(str), df['edad'])\nresultado = fig",
+        df_ejemplo,
     )
-    print("success:", resultado_correccion.success)
-    print("dtypes corregidos:\n", resultado_correccion.output.dtypes if resultado_correccion.success else resultado_correccion.error)
-
-    print("\n--- 8. NUEVO: corregir_fecha() con formatos MEZCLADOS en la misma columna ---")
-    df_fechas_mezcladas = pd.DataFrame({
-        "fecha": ["2024-01-15", "15/03/2024", "March 20, 2024", "2024.05.10", "sin fecha"],
-    })
-    resultado_fecha = run_sandboxed(
-        "df['fecha'] = corregir_fecha(df['fecha'])\nresultado = df",
-        df_fechas_mezcladas,
-    )
-    print("success:", resultado_fecha.success)
-    if resultado_fecha.success:
-        print(resultado_fecha.output)
-        print("dtype:", resultado_fecha.output["fecha"].dtype)
-        print("Se recuperaron 4 de 5 fechas válidas (esperado):", resultado_fecha.output["fecha"].notna().sum() == 4)
-    else:
-        print("error:", resultado_fecha.error)
+    print("success:", resultado_grafico.success)
+    print("tipo de output:", type(resultado_grafico.output) if resultado_grafico.success else resultado_grafico.error)

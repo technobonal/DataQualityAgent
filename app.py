@@ -21,7 +21,7 @@ def load_css(file_path: str):
 
 def render_header():
     """Renderiza el título y la tarjeta descriptiva de la aplicación."""
-    st.title(f"{APP_ICON} {APP_TITLE}")
+    st.markdown(f'<h1 class="app-title">{APP_TITLE}</h1>', unsafe_allow_html=True)
     st.markdown(
         """
         <div class="hero-card">
@@ -65,15 +65,12 @@ def main():
     # 7. Renderizar Sidebar y Tabs
     manager.render_sidebar()
 
-    tab_diagnostico, tab_chat, tab_analisis, tab_herramientas, tab_diccionario = st.tabs(
-        ["📋 Diagnóstico", "💬 Chat", "🧮 Análisis libre", "🔧 Herramientas", "📖 Diccionario"]
+    tab_diagnostico, tab_analisis, tab_herramientas, tab_diccionario = st.tabs(
+        ["Diagnóstico", "Análisis libre", "Herramientas", "Diccionario"]
     )
 
     with tab_diagnostico:
         diagnostico_tab.render(manager)
-
-    with tab_chat:
-        chat_tab.render(manager)
 
     with tab_analisis:
         analisis_tab.render(manager)

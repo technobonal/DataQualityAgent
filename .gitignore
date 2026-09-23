@@ -17,3 +17,6 @@ chroma_db/
 
 .pytest_cache/
 .ipynb_checkpoints/
+
+# Salidas de datos
+resultado_actualizado.csv

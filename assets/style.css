@@ -1,85 +1,135 @@
 :root {
-    --lila: #B794D4;
-    --lila-oscuro: #5C3D7A;
-    --lila-fondo: #E6D4F4; /* <-- Nuevo lila intermedio */
+    --cian: #2dd4ff;
+    --azul-oscuro: #16233f;
+    --fondo: #0a0e1a; /* <-- Antes era lila-fondo claro, ahora azul marino oscuro */
 }
 
-/* Forzamos el fondo lila en el contenedor principal (lado derecho) */
-.stApp, 
+/* Forzamos el fondo oscuro en el contenedor principal (lado derecho) */
+.stApp,
 [data-testid="stAppViewContainer"] {
-    background-color: var(--lila-fondo) !important;
+    background-color: var(--fondo) !important;
 }
 
-/* Título principal */
-h1 {
-    color: var(--lila-oscuro) !important;
-    font-weight: 700 !important;
+/* Título principal con degradé brillante estilo "glow" */
+h1,
+.app-title {
+    background: linear-gradient(90deg, #7be9ff 0%, var(--cian) 50%, #4f8dff 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+    font-weight: 800 !important;
+    letter-spacing: -0.5px;
+    filter: drop-shadow(0 0 10px rgba(45, 212, 255, 0.75)) drop-shadow(0 0 26px rgba(45, 212, 255, 0.4));
 }
 
 /* Tarjeta de descripción */
 .hero-card {
-    background: #FFFFFF;
-    border: 1px solid #E6D4F2;
-    border-left: 5px solid var(--lila);
+    background: #10182b;
+    border: 1px solid #1e2a45;
+    border-left: 5px solid var(--cian);
     border-radius: 14px;
     padding: 1.1rem 1.3rem;
     margin: 0.3rem 0 1.4rem 0;
-    box-shadow: 0 2px 8px rgba(92, 61, 122, 0.06);
-    color: #3D2F4A !important;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+    color: #eef2fb !important;
     font-size: 1.05rem;
     line-height: 1.55;
 }
 
 .hero-card strong {
-    color: #5C3D7A !important;
+    color: var(--cian) !important;
 }
 
 /* Uploader */
 .stFileUploader {
-    background: #FFFFFF;
-    border: 1px dashed #D4B8E8;
+    background: #10182b;
+    border: 1px dashed #2a3a5c;
     border-radius: 12px;
     padding: 0.75rem;
 }
 
-/* Botones */
-.stButton > button {
-    background: var(--lila) !important;
-    color: white !important;
+/* Botones (incluye descarga, que antes quedaba invisible en estado disabled) */
+.stButton > button,
+.stDownloadButton > button {
+    background: linear-gradient(135deg, #6ee4ff 0%, var(--cian) 100%) !important;
+    color: #04121e !important;
     border-radius: 10px !important;
     border: none !important;
-    font-weight: 600 !important;
+    font-weight: 700 !important;
+    transition: filter 0.15s ease;
 }
-.stButton > button:hover {
-    background: var(--lila-oscuro) !important;
-    color: white !important;
+.stButton > button p,
+.stDownloadButton > button p {
+    color: #04121e !important;
+}
+.stButton > button:hover,
+.stDownloadButton > button:hover {
+    filter: brightness(1.12);
 }
 
-/* Tab activa */
-button[data-baseweb="tab"][aria-selected="true"] {
-    color: var(--lila-oscuro) !important;
-    border-bottom: 3px solid var(--lila) !important;
+/* Estado disabled: gris azulado legible, no negro sobre negro */
+.stButton > button:disabled,
+.stDownloadButton > button:disabled {
+    background: #1e2a45 !important;
+    opacity: 1 !important;
+}
+.stButton > button:disabled p,
+.stDownloadButton > button:disabled p {
+    color: #5b6b8c !important;
+}
+
+/* Nombre de las tabs: negrita + degradé brillante (estructura real: div[role="tab"] con react-aria) */
+[data-testid="stTabs"] [role="tab"] [data-testid="stMarkdownContainer"] p {
+    background: linear-gradient(90deg, #7be9ff 0%, var(--cian) 100%) !important;
+    -webkit-background-clip: text !important;
+    background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+    color: transparent !important;
+    font-weight: 800 !important;
+    font-size: 1.05rem;
+    filter: drop-shadow(0 0 6px rgba(45, 212, 255, 0.45));
+}
+
+/* Tab activa: glow más intenso, igual que el título */
+[data-testid="stTabs"] [role="tab"][aria-selected="true"] [data-testid="stMarkdownContainer"] p {
+    filter: drop-shadow(0 0 8px rgba(45, 212, 255, 0.8)) drop-shadow(0 0 18px rgba(45, 212, 255, 0.4));
+}
+
+/* Indicador de selección real (la barrita bajo la tab activa) — en cian, no rojo */
+[data-testid="stTabs"] .react-aria-SelectionIndicator {
+    background-color: var(--cian) !important;
 }
 
 /* Mejor contraste en Diagnóstico */
 [data-testid="stMarkdownContainer"] p,
 [data-testid="stMarkdownContainer"] li,
 [data-testid="stMarkdownContainer"] span {
-    color: #2F243D !important;
+    color: #eef2fb !important;
     font-weight: 500;
 }
 
-/* Score y títulos de sección más oscuros */
-[data-testid="stMarkdownContainer"] h1,
+/* Score y títulos de sección con el mismo brillo que el título principal */
 [data-testid="stMarkdownContainer"] h2,
-[data-testid="stMarkdownContainer"] h3,
-[data-testid="stMarkdownContainer"] strong {
-    color: #3D2A55 !important;
+[data-testid="stMarkdownContainer"] h3 {
+    background: linear-gradient(90deg, #6ee4ff 0%, var(--cian) 55%, #4f8dff 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+    font-weight: 800 !important;
+    letter-spacing: -0.3px;
+    filter: drop-shadow(0 0 10px rgba(45, 212, 255, 0.5));
 }
 
-/* Si las cajas azules vienen con HTML inline, forzamos texto oscuro */
+/* Negritas sueltas en texto normal (no títulos): cian sólido, sin glow */
+[data-testid="stMarkdownContainer"] strong {
+    color: var(--cian) !important;
+}
+
+/* Si las cajas azules vienen con HTML inline, forzamos texto claro */
 div[style*="background"] {
-    color: #2F243D !important;
+    color: #eef2fb !important;
 }
 
 /* ---assets/style.css --- */
@@ -87,45 +137,39 @@ div[style*="background"] {
 /* --- PARCHE DE CORRECCIONES DE CONTRASTE (FONDOS OSCUROS) --- */
 
 /* 1. Títulos en la Sidebar (ej: "Sesión actual") */
-/* Usamos un lila mucho más claro para que resalte */
-[data-testid="stSidebar"] h1, 
-[data-testid="stSidebar"] h2, 
+[data-testid="stSidebar"] h1,
+[data-testid="stSidebar"] h2,
 [data-testid="stSidebar"] h3 {
-    color: #D4BEE8 !important; /* Lila muy claro y legible */
+    color: var(--cian) !important;
+    background: none !important;
+    -webkit-text-fill-color: var(--cian) !important;
+    filter: none !important;
 }
 
 /* 2. Texto General en la Sidebar (ej: Recuento de filas/columnas) */
-/* Añadimos strong, span y b para atrapar cualquier formato extra */
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] span,
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] strong,
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] b {
-    color: #FFFFFF !important; /* Blanco puro */
+    color: #FFFFFF !important;
     font-weight: 500;
 }
 
 /* 3. Iconos en la Sidebar (ej: la nube) */
-/* Forzamos que los iconos también sean blancos */
 [data-testid="stSidebar"] svg {
     fill: #FFFFFF !important;
 }
 
 /* 4. Cabeceras de Tabla (ej: "Region", "State") */
-/* Hacemos que el texto de las cabeceras sea blanco */
 thead th {
-    color: #FFFFFF !important; /* Blanco puro */
+    color: #FFFFFF !important;
 }
 
-/* 5. Texto del Botón de Descarga */
-/* Target específico para el texto dentro del botón de descarga */
-.stDownloadButton > button p {
-    color: #DDC8F0 !important; /* Lila suave y legible */
-}
 /* --- Nota aclaratoria fija al pie del chat --- */
 .chat-disclaimer {
     text-align: center;
     font-size: 0.82rem;
-    color: #6A557A !important; /* Lila oscuro discreto para buena lectura */
+    color: #9aa8c7 !important; /* Gris azulado discreto para buena lectura sobre fondo oscuro */
     margin-top: 8px;
     margin-bottom: 12px;
     font-weight: 400;

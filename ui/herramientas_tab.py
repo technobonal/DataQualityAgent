@@ -3,14 +3,102 @@ ui/herramientas_tab.py
 
 Tab de Herramientas manuales — un input dedicado para cada una de las 15
 tools, para control preciso sin depender del LLM.
+
+NUEVO — Renombrar columna / Agregar columna nueva: a diferencia de las
+15 tools de arriba (que se aplican directo con un solo click, vía
+ejecutar_manual + tool_result_block), estas dos van por un flujo HITL
+de dos pasos (preview → Aplicar/Descartar), mismo patrón que
+ui/analisis_tab.py. Motivo: es una decisión explícita del usuario, no
+una inconsistencia -- las 15 tools existentes ya tienen "Deshacer" como
+red de seguridad; acá se pidió ver el cambio antes de confirmarlo.
+
+Ambas funciones (renombrar_columna, agregar_columna_vacia) viven en
+analysis/pandasai_wrapper.py, NO en tools/tool_definitions.py -- son
+determinísticas (sin LLM) pero conceptualmente son transformaciones de
+columnas, mismo lugar que corregir_columnas/eliminar_columnas. Por eso
+no pasan por dispatch_tool() ni por ejecutar_manual().
+
+FIX -- refresh de diagnóstico: hasta esta revisión, ni las 15 tools
+existentes ni las 2 nuevas actualizaban manager.set_diagnostico()
+después de aplicar un cambio (a diferencia de ui/analisis_tab.py, que
+sí lo hace en cada _manejar_*_pendiente) -- el score de calidad mostrado
+en Diagnóstico quedaba desactualizado tras usar cualquier herramienta
+manual hasta que el usuario forzara un refresh por otro lado. Ahora se
+refresca en los 3 puntos de confirmación: una vez en render() para las
+15 tools (cubre todos los branches sin repetir la llamada en cada uno),
+y una vez en cada _manejar_*_pendiente para renombrar/agregar columna.
 """
 
 from __future__ import annotations
 
 import streamlit as st
 
+from analysis.pandasai_wrapper import (
+    agregar_columna_vacia,
+    renombrar_columna,
+    resumen_columna_agregada,
+    resumen_renombrado_columna,
+)
+from core.agent import run_diagnosis
+from core.memory import record_action
 from ui.state import StateManager
 from ui.components import multiselect_opcional, ejecutar_manual, tool_result_block
+
+_KEY_RENOMBRAR_PENDIENTE = "herramientas_renombrar_pendiente"
+_KEY_AGREGAR_COLUMNA_PENDIENTE = "herramientas_agregar_columna_pendiente"
+
+
+def _manejar_renombrar_pendiente(manager: StateManager, sesion) -> None:
+    pendiente = st.session_state.get(_KEY_RENOMBRAR_PENDIENTE)
+    if pendiente is None:
+        return
+    st.info(
+        f"Se va a renombrar **{pendiente['columna_actual']}** → "
+        f"**{pendiente['nuevo_nombre']}**"
+    )
+    col_aplicar, col_descartar = st.columns(2)
+    if col_aplicar.button("✅ Aplicar renombrado", key="aplicar_renombrar_col"):
+        record_action(
+            sesion,
+            tool_name="renombrar_columna",
+            arguments={
+                "columna_actual": pendiente["columna_actual"],
+                "nuevo_nombre": pendiente["nuevo_nombre"],
+            },
+            result_summary=pendiente["resumen"],
+            new_df=pendiente["df_nuevo"],
+        )
+        manager.set_diagnostico(run_diagnosis(sesion))
+        del st.session_state[_KEY_RENOMBRAR_PENDIENTE]
+        st.rerun()
+    if col_descartar.button("❌ Descartar", key="descartar_renombrar_col"):
+        del st.session_state[_KEY_RENOMBRAR_PENDIENTE]
+        st.rerun()
+
+
+def _manejar_agregar_columna_pendiente(manager: StateManager, sesion) -> None:
+    pendiente = st.session_state.get(_KEY_AGREGAR_COLUMNA_PENDIENTE)
+    if pendiente is None:
+        return
+    st.info(f"Se va a agregar la columna **{pendiente['nombre_columna']}** ({pendiente['resumen']['posicion']})")
+    col_aplicar, col_descartar = st.columns(2)
+    if col_aplicar.button("✅ Aplicar columna nueva", key="aplicar_agregar_col"):
+        record_action(
+            sesion,
+            tool_name="agregar_columna_vacia",
+            arguments={
+                "nombre_columna": pendiente["nombre_columna"],
+                "entre_columnas": pendiente["entre_columnas"],
+            },
+            result_summary=pendiente["resumen"],
+            new_df=pendiente["df_nuevo"],
+        )
+        manager.set_diagnostico(run_diagnosis(sesion))
+        del st.session_state[_KEY_AGREGAR_COLUMNA_PENDIENTE]
+        st.rerun()
+    if col_descartar.button("❌ Descartar", key="descartar_agregar_col"):
+        del st.session_state[_KEY_AGREGAR_COLUMNA_PENDIENTE]
+        st.rerun()
 
 
 def render(manager: StateManager) -> None:
@@ -21,6 +109,12 @@ def render(manager: StateManager) -> None:
         return
 
     st.caption("Ejecutá cualquier tool directamente, sin pasar por el chat.")
+
+    # Preview pendiente de renombrado/agregado de columna (si hay) va
+    # antes del selector, para que no se pierda al reinteractuar con
+    # el resto del formulario.
+    _manejar_renombrar_pendiente(manager, sesion)
+    _manejar_agregar_columna_pendiente(manager, sesion)
 
     columnas = sesion.current_df.columns.tolist()
     columnas_numericas = sesion.current_df.select_dtypes(include="number").columns.tolist()
@@ -41,6 +135,8 @@ def render(manager: StateManager) -> None:
         "Tratar outliers",
         "Generar reporte de calidad",
         "Diagnosticar y recomendar",
+        "Renombrar columna",
+        "Agregar columna nueva",
     ])
 
     resultado_ejecucion = None
@@ -178,5 +274,67 @@ def render(manager: StateManager) -> None:
                 "duplicate_subset": dup_subset, "outlier_columns": out_cols,
             }, sesion)
 
-    # ── Resultado ────────────────────────────────────────────
+    # ── 16. Renombrar columna (NUEVO, HITL: preview -> Aplicar/Descartar) ──
+    elif herramienta == "Renombrar columna":
+        columna_actual = st.selectbox("Columna a renombrar", columnas, key="renombrar_col_actual")
+        nuevo_nombre = st.text_input("Nuevo nombre", key="renombrar_col_nuevo_nombre")
+        if st.button("Renombrar columna"):
+            try:
+                df_nuevo = renombrar_columna(sesion.current_df, columna_actual, nuevo_nombre)
+                resumen = resumen_renombrado_columna(columna_actual, nuevo_nombre.strip())
+                st.session_state[_KEY_RENOMBRAR_PENDIENTE] = {
+                    "columna_actual": columna_actual,
+                    "nuevo_nombre": nuevo_nombre.strip(),
+                    "df_nuevo": df_nuevo,
+                    "resumen": resumen,
+                }
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+
+    # ── 17. Agregar columna nueva (NUEVO, HITL: preview -> Aplicar/Descartar) ──
+    elif herramienta == "Agregar columna nueva":
+        nombre_columna_nueva = st.text_input("Nombre de la columna nueva", key="agregar_col_nombre")
+
+        opciones_posicion = ["Al final"]
+        if len(columnas) >= 2:
+            opciones_posicion.append("Entre dos columnas")
+        posicion = st.radio("¿Dónde va la columna?", opciones_posicion, key="agregar_col_posicion")
+
+        entre_columnas = None
+        if posicion == "Entre dos columnas":
+            # Solo se puede elegir la columna IZQUIERDA -- la derecha se
+            # deriva automáticamente como la siguiente columna en el
+            # orden actual, así el par siempre es adyacente por
+            # construcción (nunca dispara el ValueError de no-adyacencia
+            # de agregar_columna_vacia()).
+            columna_izquierda = st.selectbox(
+                "Insertar después de la columna",
+                columnas[:-1],
+                key="agregar_col_izquierda",
+            )
+            idx = columnas.index(columna_izquierda)
+            columna_derecha = columnas[idx + 1]
+            st.caption(f"Va a quedar entre **{columna_izquierda}** y **{columna_derecha}**.")
+            entre_columnas = (columna_izquierda, columna_derecha)
+
+        if st.button("Agregar columna"):
+            try:
+                df_nuevo = agregar_columna_vacia(
+                    sesion.current_df, nombre_columna_nueva, entre_columnas
+                )
+                resumen = resumen_columna_agregada(nombre_columna_nueva.strip(), entre_columnas)
+                st.session_state[_KEY_AGREGAR_COLUMNA_PENDIENTE] = {
+                    "nombre_columna": nombre_columna_nueva.strip(),
+                    "entre_columnas": entre_columnas,
+                    "df_nuevo": df_nuevo,
+                    "resumen": resumen,
+                }
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+
+    # ── Resultado (tools 1-15, ejecución directa) ────────────
+    if resultado_ejecucion is not None:
+        manager.set_diagnostico(run_diagnosis(sesion))
     tool_result_block(resultado_ejecucion)

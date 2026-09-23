@@ -26,14 +26,29 @@ _KEY_IS_PROCESSING = "is_processing"
 _KEY_CHAT_TABLES = "chat_tables"
 _KEY_CHAT_FALLBACK_MSGS = "chat_fallback_msgs"
 
-# NOTA: estas dos keys pertenecen conceptualmente a ui/analisis_tab.py
-# (_KEY_HISTORIAL y _KEY_CORRECCION_PENDIENTE ahí) -- se duplican los
-# strings literales acá, en vez de importarlas, para evitar un import
-# circular (ui/analisis_tab.py ya importa StateManager desde este
-# archivo). Si cambiás el nombre de esas keys en analisis_tab.py,
-# actualizá también estas dos constantes.
+# NOTA: estas keys pertenecen conceptualmente a ui/analisis_tab.py
+# (_KEY_HISTORIAL, _KEY_CORRECCION_PENDIENTE y _KEY_ELIMINACION_PENDIENTE
+# ahí) -- se duplican los strings literales acá, en vez de importarlas,
+# para evitar un import circular (ui/analisis_tab.py ya importa
+# StateManager desde este archivo). Si cambiás el nombre de esas keys en
+# analisis_tab.py, actualizá también estas constantes.
 _KEY_ANALISIS_HISTORIAL = "analisis_libre_historial"
 _KEY_ANALISIS_CORRECCION_PENDIENTE = "analisis_libre_correccion_pendiente"
+# NUEVO -- misma razón por la que _KEY_ANALISIS_CORRECCION_PENDIENTE ya
+# estaba acá: si no se limpia en reset(), al subir un dataset distinto
+# quedaría colgada una propuesta de eliminación del dataset anterior.
+_KEY_ANALISIS_ELIMINACION_PENDIENTE = "analisis_libre_eliminacion_pendiente"
+_KEY_ANALISIS_CELDAS_PENDIENTE = "analisis_libre_celdas_pendiente"
+_KEY_ANALISIS_ELIMINACION_COLUMNAS_PENDIENTE = "analisis_libre_eliminacion_columnas_pendiente"
+_KEY_ANALISIS_ACLARACION_PENDIENTE = "analisis_libre_aclaracion_pendiente"
+_KEY_ANALISIS_TIPO_FORZADO = "_analisis_tipo_forzado"
+
+# NUEVO -- mismo motivo que las de arriba, pero para las propuestas
+# pendientes de ui/herramientas_tab.py (renombrar columna / agregar
+# columna nueva). Se duplican los strings literales acá por la misma
+# razón (evitar import circular con herramientas_tab.py).
+_KEY_HERRAMIENTAS_RENOMBRAR_PENDIENTE = "herramientas_renombrar_pendiente"
+_KEY_HERRAMIENTAS_AGREGAR_COLUMNA_PENDIENTE = "herramientas_agregar_columna_pendiente"
 
 
 class StateManager:
@@ -133,15 +148,17 @@ class StateManager:
         Borra toda la sesión para empezar de cero.
 
         FIX: antes solo limpiaba las keys de esta clase (sesión,
-        diagnóstico, tablas del chat) -- pero el historial de la tab de
-        Análisis libre (ui/analisis_tab.py) vive en su PROPIA key de
-        session_state, separada a propósito (ver docstring de ese
+        diagnóstico, tablas del chat) -- pero el historial y las
+        propuestas pendientes de la tab de Análisis libre
+        (ui/analisis_tab.py) viven en sus PROPIAS keys de
+        session_state, separadas a propósito (ver docstring de ese
         archivo). Sin esto, al resetear y subir un dataset DISTINTO, las
-        preguntas/respuestas del dataset anterior seguían ahí -- y con
-        el mecanismo de contexto_previo (analysis/pandasai_wrapper.py),
-        ese historial viejo se le pasaría como contexto al LLM para
-        preguntas sobre el dataset NUEVO, confundiéndolo en vez de
-        ayudar.
+        preguntas/respuestas -- y cualquier corrección o eliminación
+        pendiente -- del dataset anterior seguían ahí: además de
+        confundir al contexto_previo (analysis/pandasai_wrapper.py), una
+        propuesta de eliminación pendiente colgada terminaría
+        aplicándose (o mostrándose) sobre el dataset NUEVO si el usuario
+        la confirmaba sin darse cuenta de que era de otro archivo.
         """
         st.session_state[_KEY_SESSION] = None
         st.session_state[_KEY_DIAGNOSTICO] = None
@@ -150,4 +167,13 @@ class StateManager:
         st.session_state[_KEY_CHAT_FALLBACK_MSGS] = {}
         st.session_state[_KEY_ANALISIS_HISTORIAL] = []
         st.session_state.pop(_KEY_ANALISIS_CORRECCION_PENDIENTE, None)
+        st.session_state.pop(_KEY_ANALISIS_ELIMINACION_PENDIENTE, None)
+        # NUEVO — pendientes de analisis_tab (celdas, columnas, router)
+        st.session_state.pop(_KEY_ANALISIS_CELDAS_PENDIENTE, None)
+        st.session_state.pop(_KEY_ANALISIS_ELIMINACION_COLUMNAS_PENDIENTE, None)
+        st.session_state.pop(_KEY_ANALISIS_ACLARACION_PENDIENTE, None)
+        st.session_state.pop(_KEY_ANALISIS_TIPO_FORZADO, None)
+        # NUEVO — pendientes de herramientas_tab (renombrar/agregar columna)
+        st.session_state.pop(_KEY_HERRAMIENTAS_RENOMBRAR_PENDIENTE, None)
+        st.session_state.pop(_KEY_HERRAMIENTAS_AGREGAR_COLUMNA_PENDIENTE, None)
         st.rerun()

@@ -1,127 +1,182 @@
-# 🧹 DataQualityAgent
+DataQualityAgent
 
-Agente de calidad de datos con interfaz conversacional. Subí un archivo CSV o Excel y el agente te dice qué falta limpiar, con un score de calidad — o chateá en lenguaje natural para que lo haga por vos.
+📋 Descripción General
+
+DataQualityAgent es una aplicación construida en Streamlit que automatiza la limpieza, el control de calidad y el análisis exploratorio de datasets, combinando un motor determinístico basado en pandas con capacidades de lenguaje natural impulsadas por LLM.
+
+El sistema permite a un usuario cargar un archivo de datos y, mediante una interfaz conversacional o herramientas guiadas, ejecutar tareas como:
+
+Diagnóstico de calidad de datos (nulos, duplicados, tipos, outliers).
+Limpieza y estandarización de columnas (normalización, binning, formateo).
+Corrección de datos y eliminación de filas mediante instrucciones en lenguaje natural.
+Trazabilidad completa de cada transformación aplicada sobre el dataset.
+
+El agente implementa el patrón de tool calling / function calling: en lugar de generar y ejecutar código libremente, el modelo de lenguaje interpreta la intención del usuario y selecciona qué función invocar de un conjunto de 15 herramientas predefinidas (definidas con un schema estilo OpenAI, compatible con Groq vía LiteLLM). El LLM decide qué herramienta usar y con qué argumentos, pero nunca ejecuta código arbitrario directamente — toda invocación pasa por un despachador de herramientas (dispatch_tool) que valida y ejecuta únicamente funciones ya escritas y auditadas. Para los casos que requieren generación dinámica de código (por ejemplo, correcciones ambiguas en lenguaje natural), esa generación queda aislada dentro de un entorno controlado (sandbox), nunca en el flujo principal del agente.
 
 ---
 
-## ✨ Features
+## 🏗️ Arquitectura de la Solución
 
-- **Diagnóstico automático** — al subir el archivo, corre un análisis completo y muestra qué hace falta limpiar (y qué NO), con un score de 0 a 100.
-- **Chat en lenguaje natural** — pedile al agente que limpie tus datos como si hablaras con un compañero de equipo. El agente decide qué herramienta(s) usar.
-- **15 herramientas de limpieza** — valores faltantes, duplicados, outliers, formato de datos, nombres de columnas, texto, estandarización, normalización, binning, one-hot encoding, y más.
-- **Control manual** — si preferís, ejecutá cada herramienta directamente desde un panel visual, sin pasar por el chat.
-- **Diccionario de datos (RAG)** — subí un PDF/Word/Excel/CSV que explique las columnas y el chat lo usa como contexto.
-- **Undo/Reset** — deshacé cualquier paso o volvé al archivo original en cualquier momento.
-- **Seguridad** — detección de prompt injection en los datos, rate limiting, sandbox para código generado.
+El proyecto está organizado en módulos con responsabilidades claramente separadas:
+
+```
+DataQualityAgent/
+├── app.py                     # Punto de entrada de la aplicación Streamlit
+├── core/
+│   ├── agent.py                # Orquestador principal (run_diagnosis, send_message)
+│   └── memory.py                # SessionMemory: estado de sesión y trazabilidad
+├── cleaning/
+│   ├── missing_values.py        # Manejo de valores faltantes
+│   ├── formatting.py            # Formateo de columnas
+│   ├── standardization.py       # Estandarización (z-score)
+│   ├── normalization.py         # Normalización (min-max)
+│   └── binning.py               # Binning (equal_width, equal_frequency, custom)
+├── quality/
+│   └── profiler.py              # Motor de perfilado determinístico (pandas puro, sin LLM)
+├── analysis/
+│   └── pandasai_wrapper.py      # Integración con PandasAI para correcciones vía LLM
+├── security/
+│   └── sandbox.py               # Entorno aislado para ejecución de código generado
+├── rag/
+│   ├── ingest.py                 # Ingesta de documentos
+│   ├── vectorstore.py            # Almacenamiento vectorial
+│   └── validator.py              # Validación de contenido recuperado
+├── tools/
+│   └── tool_definitions.py       # Definición de herramientas (schema tipo OpenAI) y dispatch_tool()
+└── ui/
+    ├── analisis_tab.py            # Tab principal de análisis libre
+    └── state.py                   # Manejo de estado de la interfaz
+```
+
+### Flujo de orquestación
+
+1. El usuario interactúa desde la interfaz de Streamlit (carga de archivo, preguntas, solicitudes de limpieza).
+2. `core/agent.py` recibe la solicitud y decide qué herramienta ejecutar.
+3. Toda acción sobre el dataset pasa por `dispatch_tool()`, que solo puede invocar el conjunto fijo de funciones ya escritas y probadas en `tools/tool_definitions.py`.
+4. Para tareas que requieren generación dinámica de código (por ejemplo, corregir una columna con una instrucción ambigua en lenguaje natural), se utiliza `analysis/pandasai_wrapper.py`, cuyo código se ejecuta exclusivamente dentro de `security/sandbox.py`.
+5. Cada modificación al dataset se registra a través de `record_action()` en `core/memory.py`, actualizando el DataFrame actual y manteniendo un historial completo (`df_history`) y un log de acciones (`actions_log`).
+
+### Manejo de estado
+
+`SessionMemory` centraliza el estado de la sesión:
+
+- `current_df` / `original_df`: dataset en su estado actual y original.
+- `df_history`: historial de versiones del dataset tras cada transformación.
+- `actions_log`: registro auditable de cada acción ejecutada.
+- `rate_limiter`: control de frecuencia de llamadas.
+
+Esto garantiza trazabilidad total: en cualquier momento se puede saber qué se cambió, cuándo y con qué herramienta.
 
 ---
 
-## 🛠️ Instalación
+🛠️ Tecnologías y Herramientas Utilizadas
+Categoría	Tecnología
+Interfaz de usuario	Streamlit
+Procesamiento de datos	pandas
+Orquestación LLM	LiteLLM (compatible con Groq)
+Patrón de agente	Tool Calling / Function Calling
+Generación de código dinámico	PandasAI
+Definición de herramientas	Schema estilo OpenAI (tool calling)
+Recuperación aumentada (RAG)	Vectorstore propio + validadores
+Testing	streamlit.testing.v1.AppTest
+Lenguaje	Python
+---
+
+## 🚀 Instrucciones para Ejecutar el Proyecto
+
+### 1. Clonar el repositorio
 
 ```bash
-# 1. Clonar el repositorio
-git clone <url-del-repo>
-cd DataqualityAgent
+git clone <url-del-repositorio>
+cd DataQualityAgent
+```
 
-# 2. Crear y activar entorno virtual
-python -m venv venv
-venv\Scripts\activate        # Windows
-# source venv/bin/activate   # macOS/Linux
+### 2. Crear entorno virtual e instalar dependencias
 
-# 3. Instalar dependencias
+```bash
+python -m venv .venv
+source .venv/bin/activate      # En Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-
-# 4. Configurar variables de entorno
-copy .env.example .env
-# Editá .env con tus API keys (ver abajo)
 ```
 
-### API Keys necesarias
+### 3. Configurar variables de entorno
 
-| Servicio | Para qué se usa | Dónde conseguirla |
-|---|---|---|
-| **Groq** (obligatoria) | LLM principal (Llama 3.3 70B) | [console.groq.com/keys](https://console.groq.com/keys) |
-| **Cohere** (opcional) | Embeddings para el RAG del diccionario de datos | [dashboard.cohere.com/api-keys](https://dashboard.cohere.com/api-keys) |
-| **Hugging Face** (opcional) | Detección de datos sensibles | [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) |
+Crear un archivo `.env` en la raíz del proyecto con las claves necesarias (por ejemplo, API key del proveedor LLM usado vía LiteLLM/Groq):
 
-### Modo local (sin Groq)
-
-Si preferís no usar Groq (o no tenés API key), podés usar Ollama local:
-
-```bash
-# Instalar Ollama: https://ollama.com
-ollama pull qwen2.5:7b
-ollama serve
+```
+GROQ_API_KEY=tu_api_key_aqui
 ```
 
-En el `.env`, poné `USE_LOCAL=true`.
-
----
-
-## 🚀 Uso
+### 4. Ejecutar la aplicación
 
 ```bash
 streamlit run app.py
 ```
 
-Se abre en `http://localhost:8501`. Subí un CSV o Excel y empezá a trabajar.
+### 5. Ejecutar los tests (opcional)
 
----
-
-## 📁 Arquitectura
-
-```
-DataqualityAgent/
-├── app.py                  # Orquestador Streamlit (delega a ui/)
-├── config.py               # Configuración centralizada
-├── ui/                     # Capa de presentación
-│   ├── state.py            #   StateManager (session state)
-│   ├── components.py       #   Widgets reutilizables
-│   ├── diagnostico_tab.py  #   Tab: Diagnóstico
-│   ├── chat_tab.py         #   Tab: Chat
-│   ├── herramientas_tab.py #   Tab: Herramientas manuales
-│   └── diccionario_tab.py  #   Tab: Diccionario de datos
-├── core/                   # Lógica central
-│   ├── agent.py            #   Orquestador del agente (LLM + tools)
-│   ├── memory.py           #   Memoria de sesión (historial, undo)
-│   └── llm_client.py       #   Cliente LLM (Groq + Ollama fallback)
-├── tools/
-│   └── tool_definitions.py #   Schemas + dispatcher de las 15 tools
-├── cleaning/               # Implementación de tools de limpieza
-│   ├── missing_values.py   #   Valores faltantes
-│   ├── duplicates.py       #   Duplicados
-│   ├── formatting.py       #   Formato de datos + nombres + texto
-│   ├── standardization.py  #   Estandarización z-score
-│   ├── normalization.py    #   Normalización min-max
-│   ├── binning.py          #   Discretización
-│   └── indicators.py       #   Variables indicadoras (one-hot)
-├── quality/                # Análisis de calidad
-│   ├── outliers.py         #   Detección y tratamiento de outliers
-│   ├── report.py           #   Reporte de calidad
-│   └── recommendations.py  #   Recomendaciones automáticas
-├── security/               # Seguridad
-│   ├── validators.py       #   Detección de prompt injection
-│   ├── rate_limiter.py     #   Rate limiting para Groq
-│   └── sandbox.py          #   Sandbox para código generado
-├── rag/                    # Retrieval-Augmented Generation
-│   ├── ingest.py           #   Extracción de documentos
-│   ├── validator.py        #   Validación y filtrado
-│   └── vectorstore.py      #   ChromaDB vector store
-└── tests/                  # Tests
+```bash
+pytest
 ```
 
 ---
 
-## 🔧 Stack técnico
+## 💬 Ejemplos de Preguntas que el Agente Puede Responder
 
-- **LLM**: Groq (Llama 3.3 70B) vía LiteLLM, con fallback a Ollama local
-- **Interfaz**: Streamlit
-- **Datos**: Pandas, NumPy
-- **RAG**: ChromaDB + Cohere embeddings
-- **Seguridad**: Detección de prompt injection, rate limiting, sandbox
+- "¿Cuántos valores nulos tiene cada columna?"
+- "¿Hay filas duplicadas en este dataset?"
+- "Rellená los valores nulos de la columna 'edad' con 0."
+- "Eliminá las filas donde la columna 'email' esté vacía."
+- "Normalizá la columna 'ingresos' usando min-max."
+- "Aplicá binning de frecuencia igual a la columna 'edad' en 5 grupos."
+- "Corregí el formato de la columna 'fecha' a formato estándar."
+- "Mostrame un resumen de calidad general del dataset."
 
 ---
 
-## 📝 Licencia
+## 📝 Ejemplos de Respuestas Generadas por el Agente
 
-MIT
+**Pregunta:** *"¿Cuántos valores nulos tiene cada columna?"*
+
+**Respuesta:**
+```
+Se detectaron valores nulos en las siguientes columnas:
+- edad: 12 valores nulos (3.4%)
+- email: 5 valores nulos (1.4%)
+- ciudad: 0 valores nulos
+El resto de las columnas no presenta valores faltantes.
+```
+
+**Pregunta:** *"Rellená los valores nulos de la columna 'edad' con 0."*
+
+**Respuesta:**
+```
+✅ Operación completada: se reemplazaron 12 valores nulos en la columna 'edad' por 0.
+El cambio quedó registrado en el historial de acciones.
+```
+
+**Pregunta:** *"¿Hay filas duplicadas?"*
+
+**Respuesta:**
+```
+Se encontraron 7 filas completamente duplicadas en el dataset.
+¿Deseas que las elimine o que te muestre cuáles son antes de proceder?
+```
+
+---
+
+## 🖼️ Capturas del Proyecto en Curso
+
+*(E<img width="875" height="981" alt="image9" src="https://github.com/user-attachments/assets/38cdfeeb-65f6-4548-be21-ea899cdce19a" />
+spacio reservado para agregar imágenes/screenshots del proyecto)*
+
+<img width="908" height="1049" alt="image11" src="https://github.com/user-attachments/assets/d223bcd2-55e2-4e9b-ade7-00c7eb7c85ee" />
+
+<img width="907" height="847" alt="image15" src="https://github.com/user-attachments/assets/2434f3d2-e18f-4214-aa91-19609f6cc8c6" />
+<img width="960" height="1175" alt="image14" src="https://github.com/user-attachments/assets/b40dfc6d-969b-47c5-a3ea-4b4eff26f2cd" />
+
+<!--
+![Diagnóstico inicial](ruta/a/imagen1.png)
+![Tab de análisis](ruta/a/imagen2.png)
+![Ejemplo de limpieza aplicada](ruta/a/imagen3.png)
+-->docs: agregar README completo del proyecto.
